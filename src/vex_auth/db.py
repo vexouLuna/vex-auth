@@ -1,7 +1,7 @@
 """The tables, and the migrations that make them.
 
 The service only ever reads and writes these through SQLAlchemy Core. The schema itself is owned by the
-Alembic revisions in `migrations/versions`, which run as their own step (`vexoulz-auth db upgrade`)
+Alembic revisions in `migrations/versions`, which run as their own step (`vex-auth db upgrade`)
 before the service starts; the tables here must match what the revisions create.
 """
 

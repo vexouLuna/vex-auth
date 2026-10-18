@@ -3,10 +3,10 @@
 from alembic import context
 from sqlalchemy import create_engine
 
-from vexoulz_auth.db import metadata
+from vex_auth.db import metadata
 
 url = context.config.get_main_option("sqlalchemy.url")
-assert url, "run migrations through `vexoulz-auth db`, which supplies the database URL"
+assert url, "run migrations through `vex-auth db`, which supplies the database URL"
 engine = create_engine(url)
 with engine.connect() as connection:
     context.configure(connection=connection, target_metadata=metadata)

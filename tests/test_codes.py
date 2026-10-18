@@ -7,7 +7,7 @@ from typing import Any
 from tests.conftest import ALICE, BOT_REDIRECT, SITE, VODS_REDIRECT, Harness, make_settings
 from tests.test_guards import answer, error
 from tests.test_signin import DTP, MODERATED, VODS, authorize, query
-from vexoulz_auth.app import CSRF_HEADER, LEGACY_CSRF_HEADER
+from vex_auth.app import CSRF_HEADER
 
 
 async def signed_in(h: Harness) -> dict[str, str]:
@@ -169,13 +169,13 @@ async def test_minting_shares_the_authorize_limit(h: Harness) -> None:
     assert resp.status_code == 429  # one limit for both ways of getting a code
 
 
-async def test_preflight_allows_the_old_csrf_header(h: Harness) -> None:
+async def test_preflight_refuses_the_old_csrf_header(h: Harness) -> None:
     preflight = await h.http.options(
         "/v1/codes",
         headers={
             "Origin": SITE,
             "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": f"content-type,{LEGACY_CSRF_HEADER.lower()}",
+            "Access-Control-Request-Headers": "content-type,x-vexoulz-csrf",
         },
     )
-    assert preflight.status_code == 200
+    assert preflight.status_code == 400
