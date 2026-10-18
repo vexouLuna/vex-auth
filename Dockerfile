@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.28
 
 # ── Build: install the locked dependency set into a venv with uv ───────────────
 FROM python:3.13-slim AS build
