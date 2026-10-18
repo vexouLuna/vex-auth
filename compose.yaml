@@ -5,21 +5,21 @@ services:
   db:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: vexoulz_auth
+      POSTGRES_USER: vex_auth
       POSTGRES_PASSWORD_FILE: /run/secrets/auth_db_password
-      POSTGRES_DB: vexoulz_auth
+      POSTGRES_DB: vex_auth
     secrets: [auth_db_password]
     volumes:
       - db:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vexoulz_auth"]
+      test: ["CMD-SHELL", "pg_isready -U vex_auth"]
       interval: 5s
       retries: 10
     restart: unless-stopped
 
   # Migrations are their own step: it runs to completion before the service starts.
   migrate:
-    image: ${AUTH_IMAGE:-ghcr.io/vexoulz/vexoulz-auth:main}
+    image: ${AUTH_IMAGE:-ghcr.io/vexouluna/vex-auth:main}
     command: ["db", "upgrade"]
     env_file: .env
     secrets: [auth_database_url]
@@ -28,7 +28,7 @@ services:
         condition: service_healthy
 
   auth:
-    image: ${AUTH_IMAGE:-ghcr.io/vexoulz/vexoulz-auth:main}
+    image: ${AUTH_IMAGE:-ghcr.io/vexouluna/vex-auth:main}
     env_file: .env
     secrets: [auth_database_url, auth_twitch_client_secret, auth_token_key, auth_clients]
     ports:

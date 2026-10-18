@@ -17,8 +17,8 @@ from sqlalchemy import event, insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.conftest import ALICE, Harness
-from vexoulz_auth.app import CSRF_HEADER, PROGRESS_MAX
-from vexoulz_auth.db import progress
+from vex_auth.app import CSRF_HEADER, PROGRESS_MAX
+from vex_auth.db import progress
 
 ENTRY = {"t": 1, "duration": 9, "updatedAt": 1}
 EXPIRES = "2026-10-29T12:00:00+00:00"  # the harness clock plus the default 30 days

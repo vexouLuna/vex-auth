@@ -64,7 +64,7 @@ class Settings(BaseSettings):
         secrets_dir=SECRETS_DIR if SECRETS_DIR.is_dir() else None,
     )
 
-    database_url: str = "postgresql://postgres:dev@127.0.0.1:55434/vexoulz_auth"
+    database_url: str = "postgresql://postgres:dev@127.0.0.1:55434/vex_auth"
     # Where this service is reached from browsers. Twitch sends people back to `<public_url>/callback`,
     # which must be registered on the Twitch application exactly.
     public_url: str = "http://localhost:8090"

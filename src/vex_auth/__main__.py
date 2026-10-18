@@ -1,4 +1,4 @@
-"""`vexoulz-auth serve` runs the service; `vexoulz-auth db upgrade|downgrade|current` migrates its database.
+"""`vex-auth serve` runs the service; `vex-auth db upgrade|downgrade|current` migrates its database.
 
 Migrations are their own step, run before `serve` (the container's compose file runs `db upgrade` as a
 one-shot the service waits for). `serve` never changes the schema; it refuses to start on a database
@@ -13,12 +13,12 @@ import sys
 
 import uvicorn
 
-from vexoulz_auth.config import Settings
-from vexoulz_auth.db import current, downgrade, upgrade
+from vex_auth.config import Settings
+from vex_auth.db import current, downgrade, upgrade
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="vexoulz-auth")
+    parser = argparse.ArgumentParser(prog="vex-auth")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the HTTP service")
     db = sub.add_parser("db", help="database migrations")
@@ -45,9 +45,9 @@ def main(argv: list[str] | None = None) -> int:
 
     found, head = current(url)
     if found != head:
-        print(f"database is at {found or 'nothing'}, the code needs {head}: run `vexoulz-auth db upgrade`")
+        print(f"database is at {found or 'nothing'}, the code needs {head}: run `vex-auth db upgrade`")
         return 1
-    from vexoulz_auth.app import create_app
+    from vex_auth.app import create_app
 
     config = uvicorn.Config(
         create_app(settings),
