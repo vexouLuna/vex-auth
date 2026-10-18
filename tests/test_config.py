@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from vexoulz_auth.config import Settings
+from vex_auth.config import Settings
 
 
 def test_secrets_come_from_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

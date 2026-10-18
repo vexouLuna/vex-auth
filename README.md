@@ -1,6 +1,6 @@
-# vexoulz-auth
+# vex-auth
 
-One Twitch sign-in for every vexoulz site. Sign in on any of them and the others know you too. It also
+One Twitch sign-in for every vexoul.net site. Sign in on any of them and the others know you too. It also
 keeps the few things that belong to a person rather than a browser, starting with VOD watch progress.
 
 It is a small FastAPI service over Postgres. The sites talk to it from the browser; the backends that
@@ -47,8 +47,7 @@ one-time code, like any OAuth provider.
 | `GET /healthz` | ops | the process answers (liveness; the container's `HEALTHCHECK`), no dependency checks |
 | `GET /readyz` | ops | the database answers too, else 503 naming it. Point uptime monitors here |
 
-Writes need the `X-Vex-CSRF` header with the `csrf` from `/v1/me`. The old name, `X-Vexoulz-CSRF`,
-is still accepted until every site's libraries send the new one.
+Writes need the `X-Vex-CSRF` header with the `csrf` from `/v1/me`.
 
 ## Running it
 
@@ -59,11 +58,11 @@ as variables in `.env` instead (`AUTH_TOKEN_KEY` and so on), or point `AUTH_SECR
 
 ```sh
 uv sync --extra dev
-uv run vexoulz-auth db upgrade   # before every start: migrations are their own step
-uv run vexoulz-auth serve
+uv run vex-auth db upgrade   # before every start: migrations are their own step
+uv run vex-auth serve
 ```
 
-`serve` refuses to start on a database behind the code. The container image (`ghcr.io/vexoulz/vexoulz-auth`)
+`serve` refuses to start on a database behind the code. The container image (`ghcr.io/vexouluna/vex-auth`)
 has the same entry point: run `db upgrade` as a one-shot before the service.
 
 ## Developing
@@ -72,12 +71,12 @@ Tests run against a real Postgres (`TEST_DATABASE_URL`, default `postgresql://po
 they create and drop their own database, and check that every migration downgrades.
 
 ```sh
-docker run -d --name vexoulz-auth-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:17-alpine
+docker run -d --name vex-auth-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:17-alpine
 uv run pytest
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
 
 A new migration: there is no alembic.ini (the URL comes from the environment), so copy the newest revision in
-`src/vexoulz_auth/migrations/versions/`, give it the next number, and write both `upgrade` and `downgrade`.
+`src/vex_auth/migrations/versions/`, give it the next number, and write both `upgrade` and `downgrade`.
 
 Branches follow [CONTRIBUTING.md](CONTRIBUTING.md): `main` is merge-only.
