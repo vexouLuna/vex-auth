@@ -8,19 +8,19 @@ on:
 
 jobs:
   conventions:
-    uses: vEXOULZ/conventions/.github/workflows/conventions-check.yml@v2.1.0
+    uses: vexouLuna/conventions/.github/workflows/conventions-check.yml@v2.1.1
     secrets: inherit
 
   ci:
     # The suite runs against a real Postgres, the same major as compose.yaml, and includes the
     # migrations: every revision is applied, downgraded to nothing, and applied again.
-    uses: vEXOULZ/conventions/.github/workflows/python-ci.yml@v2.1.0
+    uses: vexouLuna/conventions/.github/workflows/python-ci.yml@v2.1.1
     with:
       postgres: true
 
   image:
     needs: ci
-    uses: vEXOULZ/conventions/.github/workflows/publish-image.yml@v2.1.0
+    uses: vexouLuna/conventions/.github/workflows/publish-image.yml@v2.1.1
     permissions:
       contents: read
       packages: write
@@ -29,14 +29,14 @@ jobs:
       # migrate step and answers /healthz.
       pre-build: |
         cp .env.example .env && cp -r secrets.example secrets && docker compose config --quiet
-        docker build -t vexoulz-auth:ci .
+        docker build -t vex-auth:ci .
         docker network create ci
         docker run -d --network ci --name pg -e POSTGRES_PASSWORD=pg postgres:17-alpine
         for i in $(seq 30); do docker exec pg pg_isready -U postgres && break; sleep 1; done
         key=$(python3 -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
         set -- -e AUTH_DATABASE_URL=postgresql://postgres:pg@pg:5432/postgres -e AUTH_TOKEN_KEY="$key"
-        docker run --rm --network ci "$@" vexoulz-auth:ci db upgrade
-        docker run -d --network ci --name auth -p 8090:8090 "$@" vexoulz-auth:ci
+        docker run --rm --network ci "$@" vex-auth:ci db upgrade
+        docker run -d --network ci --name auth -p 8090:8090 "$@" vex-auth:ci
         for i in $(seq 30); do curl -fsS http://127.0.0.1:8090/healthz && exit 0; sleep 1; done
         docker logs auth
         exit 1

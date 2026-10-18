@@ -8,8 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from tests.conftest import ALICE, BOB, BOT_REDIRECT, SITE, VODS_REDIRECT, Clock, FakeTwitch, Harness, make_settings
-from vexoulz_auth.app import CSRF_HEADER, Limiter, create_app, with_query
-from vexoulz_auth.db import login_states
+from vex_auth.app import CSRF_HEADER, Limiter, create_app, with_query
+from vex_auth.db import login_states
 
 MODERATED = "user:read:moderated_channels"
 

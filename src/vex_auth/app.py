@@ -41,10 +41,10 @@ from sqlalchemy import Result, Row, and_, delete, exists, insert, literal_column
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-from vexoulz_auth import __version__
-from vexoulz_auth.config import EXTRA_SCOPES, Client, Settings, origin_of
-from vexoulz_auth.db import audit, codes, login_states, progress, sessions, twitch_tokens, users
-from vexoulz_auth.twitch import (
+from vex_auth import __version__
+from vex_auth.config import EXTRA_SCOPES, Client, Settings, origin_of
+from vex_auth.db import audit, codes, login_states, progress, sessions, twitch_tokens, users
+from vex_auth.twitch import (
     AUTHORIZE_URL,
     Profile,
     Token,
@@ -57,8 +57,6 @@ from vexoulz_auth.twitch import (
 log = structlog.get_logger(__name__)
 
 CSRF_HEADER = "X-Vex-CSRF"
-# The header's name before the vexouLuna rename. Accepted until the libraries all send CSRF_HEADER.
-LEGACY_CSRF_HEADER = "X-Vexoulz-CSRF"
 READY_TIMEOUT_S = 5  # /readyz: a database slower than this counts as down
 STATE_TTL = timedelta(minutes=10)
 CODE_TTL = timedelta(seconds=60)
@@ -227,7 +225,7 @@ def create_app(
         if owns_engine:
             await db.dispose()
 
-    app = FastAPI(title="vexoulz-auth", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="vex-auth", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None)
 
     @app.exception_handler(Refused)
     async def refused(_: Request, exc: Refused) -> Response:
@@ -242,7 +240,7 @@ def create_app(
         allow_origins=sorted(settings.origins),
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["Content-Type", CSRF_HEADER, LEGACY_CSRF_HEADER],
+        allow_headers=["Content-Type", CSRF_HEADER],
         max_age=600,
     )
 
@@ -459,7 +457,7 @@ def create_app(
     WriteConn = Annotated[AsyncConnection, Depends(writing, scope="function")]  # noqa: N806
 
     def check_csrf(request: Request, sess: Session) -> None:
-        sent = request.headers.get(CSRF_HEADER) or request.headers.get(LEGACY_CSRF_HEADER, "")
+        sent = request.headers.get(CSRF_HEADER, "")
         if not secrets.compare_digest(sent, sess.csrf):
             raise Refused(403, "csrf")
 
@@ -532,7 +530,7 @@ def create_app(
     async def login(request: Request) -> Response:
         return_to = request.query_params.get("return", "")
         if len(return_to) > 2000 or origin_of(return_to) not in settings.origins:
-            return PlainTextResponse("That return address is not one of the vexoulz sites.", status_code=400)
+            return PlainTextResponse("That return address is not one of the vexoul.net sites.", status_code=400)
         if not login_limit.allow(ip_of(request)):
             return PlainTextResponse("Too many sign-in attempts. Wait a minute.", status_code=429)
         async with db.begin() as conn:
@@ -871,4 +869,4 @@ def create_app(
     return app
 
 
-__all__ = ["CSRF_HEADER", "EXTRA_SCOPES", "LEGACY_CSRF_HEADER", "Limiter", "create_app", "with_query"]
+__all__ = ["CSRF_HEADER", "EXTRA_SCOPES", "Limiter", "create_app", "with_query"]
