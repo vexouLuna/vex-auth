@@ -1,1 +1,1 @@
-postgresql://vexoulz_auth:change-me@db:5432/vexoulz_auth
+postgresql://vex_auth:change-me@db:5432/vex_auth

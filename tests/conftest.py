@@ -16,13 +16,13 @@ from cryptography.fernet import Fernet
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from vexoulz_auth.app import create_app
-from vexoulz_auth.config import Settings
-from vexoulz_auth.db import downgrade, metadata, upgrade
-from vexoulz_auth.twitch import Profile, Token, TokenRevoked, TwitchError
+from vex_auth.app import create_app
+from vex_auth.config import Settings
+from vex_auth.db import downgrade, metadata, upgrade
+from vex_auth.twitch import Profile, Token, TokenRevoked, TwitchError
 
 ADMIN = "postgresql://postgres:postgres@127.0.0.1:55432/postgres"
-DB_NAME = "vexoulz_auth_test"
+DB_NAME = "vex_auth_test"
 SITE = "http://site.test"
 BOT_REDIRECT = "http://bot.test/auth/admin/callback"
 VODS_REDIRECT = "http://vods.test/admin/signin/callback"
