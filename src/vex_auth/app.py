@@ -3,9 +3,11 @@
 Browsers (the sites, from their own origins, with credentials):
   GET  /login?return=<site URL>   → Twitch → /callback → back to the site, signed in
   GET  /v1/me                     the signed-in user and their CSRF token, or 401
+  DELETE /v1/me {confirm}         forget me: revoke the Twitch grant, delete the user and everything theirs
   POST /v1/logout[?everywhere=1]  ends this session, or every session of the user
   POST /v1/codes {client_id}      a one-time code for that backend, without a redirect
-  /v1/progress[/{vodId}]          watch progress (GET, PUT, DELETE; POST /v1/progress/merge imports many)
+  /v1/progress[/{vodId}]          watch progress (GET, PUT, DELETE; POST /v1/progress/merge imports many,
+                                  DELETE /v1/progress clears it all)
 
 Backends (registered clients, HTTP Basic with their id and secret):
   GET  /authorize?client_id&redirect_uri&state[&scope]   a one-time code; straight back when already signed in
@@ -37,7 +39,23 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import Result, Row, and_, delete, exists, insert, literal_column, select, text, update
+from sqlalchemy import (
+    Result,
+    Row,
+    Text,
+    and_,
+    case,
+    delete,
+    exists,
+    func,
+    insert,
+    literal,
+    literal_column,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -123,6 +141,10 @@ class CodeIn(BaseModel):
     client_id: str = Field(max_length=200)
 
 
+class ForgetIn(BaseModel):
+    confirm: str = Field(max_length=200)  # the user's login, typed out
+
+
 class TokenIn(BaseModel):
     code: str = Field(max_length=200)
     redirect_uri: str = Field(max_length=2000)
@@ -160,6 +182,7 @@ progress_body = json_body(ProgressIn, 422, "invalid_progress")
 merge_body = json_body(ProgressMerge, 422, "invalid_progress")
 token_body = json_body(TokenIn, 400, "invalid_request")
 code_body = json_body(CodeIn, 400, "invalid_request")
+forget_body = json_body(ForgetIn, 400, "invalid_request")
 
 
 async def progress_item(vod_id: str, body: Annotated[ProgressIn, Depends(progress_body)]) -> ProgressItem:
@@ -325,6 +348,7 @@ def create_app(
         client: Client | None = None,
         client_redirect_uri: str | None = None,
         client_state: str | None = None,
+        force: bool = False,
     ) -> Response:
         nonlocal last_cleanup
         now = clock()
@@ -352,6 +376,7 @@ def create_app(
                 "response_type": "code",
                 "scope": " ".join(sorted(scopes)),
                 "state": state,
+                **({"force_verify": "true"} if force else {}),
             }
         )
         resp = RedirectResponse(f"{AUTHORIZE_URL}?{query}", status_code=302)
@@ -533,8 +558,13 @@ def create_app(
             return PlainTextResponse("That return address is not one of the vexoul.net sites.", status_code=400)
         if not login_limit.allow(ip_of(request)):
             return PlainTextResponse("Too many sign-in attempts. Wait a minute.", status_code=429)
+        # force=1 is "Reconnect Twitch": Twitch asks again, for every scope the stored token has, so the
+        # fresh token replaces it.
+        force = request.query_params.get("force") in ("1", "true")
         async with db.begin() as conn:
-            return await start_twitch(conn, set(), return_to=return_to)
+            sess = await current_session(conn, request) if force else None
+            scopes = await token_scopes(conn, sess.user_id) if sess else set()
+            return await start_twitch(conn, scopes, return_to=return_to, force=force)
 
     @app.get("/authorize")
     async def authorize(request: Request) -> Response:
@@ -647,7 +677,66 @@ def create_app(
         )
         if row is None:
             raise Refused(401, "signed_out")
-        return JSONResponse({**_user_json(row), "csrf": row.csrf, "expiresAt": row.expires_at.isoformat()})
+        return JSONResponse(
+            {
+                **_user_json(row),
+                "createdAt": row.created_at.isoformat(),
+                "csrf": row.csrf,
+                "expiresAt": row.expires_at.isoformat(),
+            }
+        )
+
+    async def revoke_grant(user_id: str, conn: AsyncConnection) -> str:
+        """Takes the user's Twitch tokens back from Twitch: "ok", "none" stored, "undecryptable" or "failed"."""
+        row = (await conn.execute(select(twitch_tokens).where(twitch_tokens.c.user_id == user_id))).first()
+        if row is None:
+            return "none"
+        try:
+            held = [fernet.decrypt(row.access_enc).decode()]
+            held += [fernet.decrypt(row.refresh_enc).decode()] if row.refresh_enc else []
+        except InvalidToken:
+            log.error("token.undecryptable", user=user_id)
+            return "undecryptable"
+        outcome = "ok"
+        for value in held:
+            try:
+                await tw.revoke(value)
+            except TwitchError as exc:
+                log.warning("twitch.revoke_failed", user=user_id, error=str(exc))
+                outcome = "failed"
+        return outcome
+
+    @app.delete("/v1/me")
+    async def forget_me(
+        request: Request, body: Annotated[ForgetIn, Depends(forget_body)], sess: WriteSession, conn: WriteConn
+    ) -> Response:
+        """Forget me. Twitch gets its tokens back (a failure is logged, never a reason to keep the data),
+        the user row goes and takes every session, code, token and progress entry with it, and the audit
+        log keeps their events under a random `anon-` id with no IP address and no login."""
+        login = await conn.scalar(select(users.c.login).where(users.c.id == sess.user_id))
+        if body.confirm.strip().lower() != (login or "").lower():
+            return _error(400, "confirm_mismatch")
+        revoked = await revoke_grant(sess.user_id, conn)
+        anon = f"anon-{secrets.token_hex(8)}"  # not a Twitch id: those are digits
+        without_login = audit.c.detail.op("-", return_type=JSONB)(literal("login", Text))
+        await conn.execute(
+            update(audit)
+            .where(audit.c.user_id == sess.user_id)
+            .values(
+                user_id=anon,
+                ip=None,
+                # an event with no detail holds JSON null, which `-` refuses
+                detail=case((func.jsonb_typeof(audit.c.detail) == "object", without_login), else_=audit.c.detail),
+            )
+        )
+        await conn.execute(
+            insert(audit).values(at=clock(), event="forgotten", user_id=anon, detail={"revoke": revoked})
+        )
+        await conn.execute(delete(users).where(users.c.id == sess.user_id))
+        log.info("forgotten", user=anon, revoke=revoked)
+        resp = Response(status_code=204)
+        resp.delete_cookie(session_cookie, path="/", secure=secure, httponly=True, samesite="lax")
+        return resp
 
     @app.post("/v1/logout")
     async def logout(
@@ -772,6 +861,11 @@ def create_app(
         """Many entries at once, newest winning each: a browser's local progress on its first sign-in."""
         await upsert_progress(conn, sess.user_id, body.items)
         return JSONResponse({"items": await progress_list(conn, sess.user_id, PROGRESS_MAX)})
+
+    @app.delete("/v1/progress")
+    async def progress_clear(sess: WriteSession, conn: WriteConn) -> Response:
+        await conn.execute(delete(progress).where(progress.c.user_id == sess.user_id))
+        return Response(status_code=204)
 
     @app.delete("/v1/progress/{vod_id}")
     async def progress_delete(vod_id: str, sess: WriteSession, conn: WriteConn) -> Response:

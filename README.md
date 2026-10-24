@@ -13,7 +13,9 @@ one-time code, like any OAuth provider.
   sites are on sibling hosts of the same site, so a credentialed `fetch` from them carries it, and CORS
   lets only the configured site origins read the answers.
 - **Signing in** (`GET /login?return=<site URL>`) goes to Twitch with no extra scope, then back to the
-  page. The return address must be on one of the configured sites.
+  page. The return address must be on one of the configured sites. `&force=1` is "Reconnect Twitch":
+  Twitch asks the person again (`force_verify`) for every scope their stored token has, and the fresh
+  token replaces it.
 - **Backends** redirect to `GET /authorize?client_id&redirect_uri&state[&scope]`. Already signed in with
   the scopes asked for, the browser comes straight back with a code; otherwise it goes through Twitch
   first. The backend trades the code (`POST /v1/token`, HTTP Basic with its id and secret) for the user
@@ -38,16 +40,43 @@ one-time code, like any OAuth provider.
 
 | Endpoint | For | What |
 |---|---|---|
-| `GET /v1/me` | sites | `{id, login, displayName, avatar, color, csrf, expiresAt}`, or 401 |
+| `GET /v1/me` | sites | `{id, login, displayName, avatar, color, createdAt, csrf, expiresAt}`, or 401 |
+| `DELETE /v1/me` | sites | forget me: `{confirm: <login>}` (any case), else 400 `confirm_mismatch`; 204 and signed out. See below |
 | `POST /v1/logout[?everywhere=1]` | sites | ends this session or all of the user's; needs `X-Vex-CSRF` |
 | `POST /v1/codes` | sites | `{client_id}` → `{code}` for that backend; 401 `signed_out`, 403 `csrf`, 409 `scope_missing`, 400 `unknown_client`, 429 `rate_limited` |
 | `GET /v1/progress[?limit=]` | sites | the user's progress, newest first |
 | `GET/PUT/DELETE /v1/progress/{vodId}` | sites | one entry; `PUT {t, duration, updatedAt}`, newest wins |
 | `POST /v1/progress/merge` | sites | `{items: [...]}`, newest wins per entry (a browser's local progress) |
+| `DELETE /v1/progress` | sites | clears all of the user's progress |
 | `GET /healthz` | ops | the process answers (liveness; the container's `HEALTHCHECK`), no dependency checks |
 | `GET /readyz` | ops | the database answers too, else 503 naming it. Point uptime monitors here |
 
 Writes need the `X-Vex-CSRF` header with the `csrf` from `/v1/me`.
+
+### Forget me: what goes and what stays
+
+`DELETE /v1/me` (the "Forget me" button on vexoul.net/account) does this, in order:
+
+1. Asks Twitch to revoke the stored access and refresh tokens. If Twitch fails, or the tokens can't be
+   decrypted, the rest still happens; the outcome is in the audit row (`revoke: ok | none | failed |
+   undecryptable`) and the logs.
+2. Rewrites the user's audit rows: their Twitch id becomes one random `anon-<hex>` code (so the rows still
+   read as one actor), the IP address is removed, and so is the login from the details.
+3. Deletes the user. That takes their Twitch tokens, every session (on every device), one-time codes and
+   watch progress with it.
+
+The backends find out through `GET /v1/sessions/{sid}`, which now answers 404: the VOD archive's admin
+drops its session at its next check (at most a minute later); the bot's admin checks the same way.
+
+**Not deleted**, because it isn't this service's data:
+
+- anything doomtp-bot keeps: chat logs, its channel and command data, and its own Twitch tokens (the
+  bot's account, not the user's);
+- the VOD archive's and the bot's own audit logs, which name admins by Twitch id;
+- the service's stdout logs, which keep sign-in lines (login and Twitch id) for as long as the host's
+  log retention does.
+
+Signing in again afterwards makes a new, empty account.
 
 ## Running it
 

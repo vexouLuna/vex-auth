@@ -80,6 +80,8 @@ class FakeTwitch:
     refreshable: dict[str, str] = field(default_factory=dict)  # refresh token -> the user id
     profiles: dict[str, Profile] = field(default_factory=dict)  # access token -> its user
     calls: list[str] = field(default_factory=list)
+    revoked: list[str] = field(default_factory=list)  # tokens taken back, in order
+    revoke_fails: bool = False
     n: int = 0
 
     def authorize(self, profile: Profile, scopes: set[str]) -> str:
@@ -119,6 +121,14 @@ class FakeTwitch:
         if access_token not in self.valid:
             raise TokenRevoked("expired")
         return self.moderated.get(user_id, [])
+
+    async def revoke(self, token: str) -> None:
+        self.calls.append("revoke")
+        if self.revoke_fails:
+            raise TwitchError("revoke failed (503)")
+        self.valid.discard(token)
+        self.refreshable.pop(token, None)
+        self.revoked.append(token)
 
 
 ALICE = Profile("100", "alice", "Alice", "https://img.test/alice.png", "#FF0000")

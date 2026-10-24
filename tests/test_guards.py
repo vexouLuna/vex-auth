@@ -85,6 +85,7 @@ async def test_me(h: Harness) -> None:
         "displayName": "Alice",
         "avatar": "https://img.test/alice.png",
         "color": "#FF0000",
+        "createdAt": "2026-09-29T12:00:00+00:00",
         "csrf": hd[CSRF_HEADER],
         "expiresAt": EXPIRES,
     }
