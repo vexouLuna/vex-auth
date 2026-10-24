@@ -409,7 +409,28 @@ def create_app(
         found = await conn.scalar(select(twitch_tokens.c.scopes).where(twitch_tokens.c.user_id == user_id))
         return set(found or ())
 
-    async def store_user(conn: AsyncConnection, profile: Profile, token: Token) -> None:
+    async def stored_tokens(conn: AsyncConnection, user_id: str) -> list[str] | None:
+        """The user's stored access and refresh tokens, decrypted; None if none are stored. Raises InvalidToken."""
+        row = (await conn.execute(select(twitch_tokens).where(twitch_tokens.c.user_id == user_id))).first()
+        if row is None:
+            return None
+        held = [fernet.decrypt(row.access_enc).decode()]
+        return held + ([fernet.decrypt(row.refresh_enc).decode()] if row.refresh_enc else [])
+
+    async def revoke_tokens(user_id: str, values: list[str]) -> str:
+        """Takes `values` back from Twitch: "ok", or "failed" (logged) if Twitch refused or failed any."""
+        outcome = "ok"
+        for value in values:
+            try:
+                await tw.revoke(value)
+            except TwitchError as exc:
+                log.warning("twitch.revoke_failed", user=user_id, error=str(exc))
+                outcome = "failed"
+        return outcome
+
+    async def store_user(conn: AsyncConnection, profile: Profile, token: Token) -> list[str]:
+        """Saves the user, and their token unless the stored one carries more scopes. Gives the tokens it
+        replaced, for the caller to revoke once the transaction is done."""
         now = clock()
         values = {
             "login": profile.login,
@@ -426,7 +447,13 @@ def create_app(
         # A plain sign-in asks Twitch for no scope. Its token must not replace one that carries more, or
         # signing in on root would take away what the bot's admin needs.
         if not token.scopes >= await token_scopes(conn, profile.id):
-            return
+            return []
+        try:
+            replaced = [
+                t for t in await stored_tokens(conn, profile.id) or [] if t not in (token.access, token.refresh)
+            ]
+        except InvalidToken:
+            replaced = []  # AUTH_TOKEN_KEY changed: nothing to hand back, the new token replaces it anyway
         stored = {
             "access_enc": fernet.encrypt(token.access.encode()),
             "refresh_enc": fernet.encrypt(token.refresh.encode()) if token.refresh else None,
@@ -438,6 +465,7 @@ def create_app(
             .values(user_id=profile.id, **stored)
             .on_conflict_do_update(index_elements=[twitch_tokens.c.user_id], set_=stored)
         )
+        return replaced
 
     async def new_session(conn: AsyncConnection, user_id: str) -> tuple[Session, str]:
         token = secrets.token_urlsafe(32)
@@ -641,7 +669,7 @@ def create_app(
             return fail("twitch", str(exc))
 
         async with db.begin() as conn:
-            await store_user(conn, profile, token)
+            replaced = await store_user(conn, profile, token)
             if old := await current_session(conn, request):  # this browser's previous sign-in ends here
                 await conn.execute(update(sessions).where(sessions.c.id == old.id).values(revoked_at=clock()))
             sess, cookie = await new_session(conn, profile.id)
@@ -651,6 +679,8 @@ def create_app(
                 url = with_query(row.client_redirect_uri, code=code_out, state=row.client_state or "")
             else:
                 url = row.return_to or "/"
+        # A token that was replaced (Reconnect Twitch, or a sign-in asking for more scopes) has no use left.
+        await revoke_tokens(profile.id, replaced)
         resp = RedirectResponse(url, status_code=302)
         resp.delete_cookie(state_cookie, path="/callback")
         set_session_cookie(resp, cookie, sess.expires_at)
@@ -688,23 +718,12 @@ def create_app(
 
     async def revoke_grant(user_id: str, conn: AsyncConnection) -> str:
         """Takes the user's Twitch tokens back from Twitch: "ok", "none" stored, "undecryptable" or "failed"."""
-        row = (await conn.execute(select(twitch_tokens).where(twitch_tokens.c.user_id == user_id))).first()
-        if row is None:
-            return "none"
         try:
-            held = [fernet.decrypt(row.access_enc).decode()]
-            held += [fernet.decrypt(row.refresh_enc).decode()] if row.refresh_enc else []
+            held = await stored_tokens(conn, user_id)
         except InvalidToken:
             log.error("token.undecryptable", user=user_id)
             return "undecryptable"
-        outcome = "ok"
-        for value in held:
-            try:
-                await tw.revoke(value)
-            except TwitchError as exc:
-                log.warning("twitch.revoke_failed", user=user_id, error=str(exc))
-                outcome = "failed"
-        return outcome
+        return "none" if held is None else await revoke_tokens(user_id, held)
 
     @app.delete("/v1/me")
     async def forget_me(

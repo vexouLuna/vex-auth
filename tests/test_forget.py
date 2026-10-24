@@ -38,7 +38,7 @@ async def test_forget_deletes_the_user_and_everything_theirs(h: Harness, engine:
     await other.http.put("/v1/progress/v1", headers=await headers(other), json=ENTRY)
 
     assert await forget(h, "Alice", headers=hd) == 204
-    assert h.twitch.revoked == ["access-2", "refresh-2"]  # the token of Alice's newest sign-in
+    assert h.twitch.revoked[-2:] == ["access-2", "refresh-2"]  # the token of Alice's newest sign-in
     assert (await h.me()).status_code == 401
     async with engine.connect() as conn:
         assert await conn.scalar(select(func.count()).select_from(users).where(users.c.id == ALICE.id)) == 0
@@ -138,7 +138,27 @@ async def test_reconnect_forces_twitch_with_the_held_scopes(h: Harness) -> None:
     params = await h.twitch_redirect(await h.http.get("/login", params={"return": SITE, "force": "1"}))
     assert params["force_verify"] == "true"
     assert params["scope"] == "user:read:moderated_channels"
+    h.twitch.revoked.clear()
     await h.approve(params, ALICE)
+    assert (await h.me()).status_code == 200
+    assert h.twitch.revoked == ["access-2", "refresh-2"]  # the replaced token, not the new one
+
+
+async def test_a_replaced_token_is_revoked_and_a_kept_one_is_not(h: Harness) -> None:
+    await h.sign_in()
+    assert h.twitch.revoked == []  # nothing stored before
+    scoped = {"client_id": "dtp", "redirect_uri": BOT_REDIRECT, "state": "s", "scope": "user:read:moderated_channels"}
+    await h.approve(await h.twitch_redirect(await h.http.get("/authorize", params=scoped)), ALICE)
+    assert h.twitch.revoked == ["access-1", "refresh-1"]  # more scopes: replaces the plain one
+    await h.sign_in()  # a plain sign-in keeps the scoped token, so nothing is revoked
+    assert h.twitch.revoked == ["access-1", "refresh-1"]
+
+
+async def test_a_failed_revoke_of_a_replaced_token_never_blocks_sign_in(h: Harness) -> None:
+    await h.sign_in()
+    h.twitch.revoke_fails = True
+    resp = await h.sign_in()
+    assert resp.status_code == 302 and resp.headers["location"] == SITE + "/watch/1"
     assert (await h.me()).status_code == 200
 
 

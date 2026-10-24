@@ -34,7 +34,8 @@ one-time code, like any OAuth provider.
   it nothing new: such a script can already call that site's backend same-origin with the user's
   cookies.
 - **Twitch tokens** are stored encrypted (`AUTH_TOKEN_KEY`). A plain sign-in never replaces a stored
-  token that carries more scopes.
+  token that carries more scopes. A token that is replaced (a reconnect, or a sign-in asking for more
+  scopes) is revoked at Twitch; a failure there is logged and never stops the sign-in.
 - **Errors** come back to the site as `?auth_error=denied|expired|twitch`, and to a backend's redirect
   address as `?error=...&state=...`.
 
