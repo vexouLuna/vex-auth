@@ -10,6 +10,7 @@ import httpx
 AUTHORIZE_URL = "https://id.twitch.tv/oauth2/authorize"
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
+REVOKE_URL = "https://id.twitch.tv/oauth2/revoke"
 HELIX = "https://api.twitch.tv/helix"
 
 
@@ -52,6 +53,10 @@ class TwitchHttp(Protocol):
         """Broadcaster ids of every channel the user moderates. Raises TokenRevoked on a 401."""
         ...
 
+    async def revoke(self, token: str) -> None:
+        """Takes back an access or refresh token. A token Twitch no longer knows counts as revoked."""
+        ...
+
 
 class TwitchClient:
     def __init__(self, client_id: str, client_secret: str, timeout: float = 10.0) -> None:
@@ -80,6 +85,16 @@ class TwitchClient:
 
     async def refresh(self, refresh_token: str) -> Token:
         return await self._token({"grant_type": "refresh_token", "refresh_token": refresh_token})
+
+    async def revoke(self, token: str) -> None:
+        try:
+            resp = await self.http.post(REVOKE_URL, data={"client_id": self.client_id, "token": token})
+        except httpx.HTTPError as exc:
+            raise TwitchError(f"revoke failed: {exc}") from exc
+        if resp.status_code == 400 and "invalid token" in resp.text.lower():
+            return  # expired or revoked already
+        if resp.status_code != 200:
+            raise TwitchError(f"revoke failed ({resp.status_code})")
 
     async def _helix(self, access_token: str, path: str, params: dict[str, str]) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {access_token}", "Client-Id": self.client_id}
