@@ -355,3 +355,10 @@ async def test_the_api_docs_are_published(h: Harness) -> None:
     spec = (await h.http.get("/openapi.json")).json()
     assert spec["info"]["title"] == "vex-auth" and "/v1/sessions/{sid}" in spec["paths"]
     assert (await h.http.get("/docs")).status_code == 200
+
+
+async def test_the_error_page_falls_back_to_the_configured_home(engine: AsyncEngine) -> None:
+    app = create_app(make_settings(home_url="https://home.test"), twitch=FakeTwitch(), engine=engine)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://auth.test") as http:
+        resp = await http.get("/login", params={"return": "https://evil.example/x"})
+    assert 'href="https://home.test"' in resp.text

@@ -57,7 +57,7 @@ Writes need the `X-Vex-CSRF` header with the `csrf` from `/v1/me`.
 Interactive docs are at `/docs` and the OpenAPI spec at `/openapi.json`. Errors are
 `{"error": "<code>"}`; a refused input (`invalid_request`, `invalid_progress`) also carries
 `"field"` (which input) and `"message"` (why), never its value. A failure a person sees in the browser
-(bad return address, an expired sign-in) is a small page with a link back to the site that started it.
+(bad return address, an expired sign-in) is a small page with a link back to the site that started it (`AUTH_HOME_URL`, default https://vexoul.net, when it can't tell which).
 
 ### Which endpoint do I call?
 

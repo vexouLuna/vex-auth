@@ -237,9 +237,9 @@ a:hover,a:focus-visible{{background:#a89cff}}
 """
 
 
-def error_page(status: int, title: str, message: str, back_to: str | None = None) -> HTMLResponse:
+def error_page(status: int, title: str, message: str, back_to: str | None, home: str) -> HTMLResponse:
     """A browser-facing failure: what happened in plain words, and a way back to the site that started it."""
-    target = back_to if back_to and origin_of(back_to) else HOME_URL
+    target = back_to if back_to and origin_of(back_to) else home
     return HTMLResponse(
         ERROR_PAGE.format(
             title=html.escape(title),
@@ -334,6 +334,10 @@ def create_app(
     db = engine or create_async_engine(settings.sqlalchemy_url, pool_pre_ping=True)
     tw: TwitchHttp = twitch or TwitchClient(settings.twitch_client_id, settings.twitch_client_secret.get_secret_value())
     secure = settings.cookie_secure
+
+    def page(status: int, title: str, message: str, back_to: str | None = None) -> HTMLResponse:
+        return error_page(status, title, message, back_to, settings.home_url)
+
     # __Host- makes the browser insist on Secure, path=/ and no Domain: the cookie can't leak to or be
     # planted from a sibling host. Plain http in development can't have it.
     session_cookie = "__Host-vxa_session" if secure else "vxa_session"
@@ -698,11 +702,9 @@ def create_app(
     async def login(request: Request) -> Response:
         return_to = request.query_params.get("return", "")
         if len(return_to) > 2000 or origin_of(return_to) not in settings.origins:
-            return error_page(
-                400, "Can't sign you in from there", "That return address is not one of the vexoul.net sites."
-            )
+            return page(400, "Can't sign you in from there", "That return address is not one of the vexoul.net sites.")
         if not login_limit.allow(ip_of(request)):
-            return error_page(429, "Too many sign-in attempts", "Wait a minute, then try again.", return_to)
+            return page(429, "Too many sign-in attempts", "Wait a minute, then try again.", return_to)
         # force=1 is "Reconnect Twitch": Twitch asks again, for every scope the stored token has, so the
         # fresh token replaces it.
         force = request.query_params.get("force") in ("1", "true")
@@ -717,9 +719,7 @@ def create_app(
         client = clients.get(q.get("client_id", ""))
         redirect_uri = q.get("redirect_uri", "")
         if client is None or redirect_uri not in client.redirect_uris:
-            return error_page(
-                400, "Can't sign you in from there", "That app or redirect address isn't registered here."
-            )
+            return page(400, "Can't sign you in from there", "That app or redirect address isn't registered here.")
         state = q.get("state", "")
         if not state or len(state) > 500:
             return RedirectResponse(with_query(redirect_uri, error="invalid_request"), status_code=302)
@@ -727,9 +727,7 @@ def create_app(
         if not requested <= client.scopes:
             return RedirectResponse(with_query(redirect_uri, error="invalid_scope", state=state), status_code=302)
         if not login_limit.allow(ip_of(request)):
-            return error_page(
-                429, "Too many sign-in attempts", "Wait a minute, then try again.", origin_of(redirect_uri)
-            )
+            return page(429, "Too many sign-in attempts", "Wait a minute, then try again.", origin_of(redirect_uri))
         async with db.begin() as conn:
             sess = await current_session(conn, request)
             held = await token_scopes(conn, sess.user_id) if sess else set()
@@ -757,7 +755,7 @@ def create_app(
                 )
             ).first()
         if row is None:
-            return error_page(
+            return page(
                 400,
                 "This sign-in has expired",
                 "It took too long, was already used, or was started in another browser. Go back and sign in again.",
@@ -775,9 +773,7 @@ def create_app(
             return resp
 
         if row.client_id and client is None:
-            return error_page(
-                400, "Can't sign you in", "The app that sent you here is no longer registered.", row.return_to
-            )
+            return page(400, "Can't sign you in", "The app that sent you here is no longer registered.", row.return_to)
         if row.expires_at <= clock():
             return fail("expired", "sign-in state expired")
         browser_state = request.cookies.get(state_cookie, "")
