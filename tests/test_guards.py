@@ -44,7 +44,12 @@ def answer(resp: httpx.Response) -> tuple[int, list[tuple[str, str]], bytes]:
     headers = [
         (k, re.sub(r"expires=[^;]*; ", "", v) if k == "set-cookie" else v) for k, v in resp.headers.multi_items()
     ]
-    return resp.status_code, headers, resp.content
+    body = resp.content
+    if resp.headers.get("content-type") == "application/json" and "field" in resp.json():
+        # a refused input also names its field and why (test_refusals_name_the_failing_field); same code here
+        body = js({"error": resp.json()["error"]})
+        headers = [(k, str(len(body)) if k == "content-length" else v) for k, v in headers]
+    return resp.status_code, headers, body
 
 
 VARY = ("vary", "Origin")  # CORS adds it to every answer
@@ -316,6 +321,16 @@ async def test_backend_routes_are_rate_limited_per_address(h: Harness) -> None:
 
 async def test_backend_reads(h: Harness) -> None:
     vods, dtp = basic("vods-admin", "vods-secret"), basic("dtp", "dtp-secret")
-    assert answer(await h.http.get("/v1/sessions/x", headers=vods)) == json_answer(404, b'{"active":false}')
+    assert answer(await h.http.get("/v1/sessions/x", headers=vods)) == json_answer(200, b'{"active":false}')
     assert answer(await h.http.get("/v1/users/1/moderated-channels", headers=vods)) == error(403, "scope_not_allowed")
     assert answer(await h.http.get("/v1/users/1/moderated-channels", headers=dtp)) == error(404, "unknown_user")
+
+
+async def test_refusals_name_the_failing_field(h: Harness) -> None:
+    hd = await signed_in(h)
+    resp = await h.http.put("/v1/progress/v1", headers=hd, json={"t": "x", "duration": 1, "updatedAt": 1})
+    body = resp.json()
+    assert (resp.status_code, body["error"], body["field"]) == (422, "invalid_progress", "t") and body["message"]
+    resp = await h.http.post("/v1/token", headers=basic("vods-admin", "vods-secret"), json={"code": "x"})
+    assert (resp.status_code, resp.json()["error"], resp.json()["field"]) == (400, "invalid_request", "redirect_uri")
+    assert (await h.http.get("/v1/progress?limit=x")).json()["field"] == "limit"

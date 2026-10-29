@@ -54,6 +54,24 @@ one-time code, like any OAuth provider.
 
 Writes need the `X-Vex-CSRF` header with the `csrf` from `/v1/me`.
 
+Interactive docs are at `/docs` and the OpenAPI spec at `/openapi.json`. Errors are
+`{"error": "<code>"}`; a refused input (`invalid_request`, `invalid_progress`) also carries
+`"field"` (which input) and `"message"` (why), never its value. A failure a person sees in the browser
+(bad return address, an expired sign-in) is a small page with a link back to the site that started it (`AUTH_HOME_URL`, default https://vexoul.net, when it can't tell which).
+
+### Which endpoint do I call?
+
+| I want to… | Call | Signed in | Signed out |
+|---|---|---|---|
+| Sign a person in (a site) | navigate to `GET /login?return=<site URL>` | back at `return`, cookie set | Twitch, then back at `return`; failure: `?auth_error=denied\|expired\|twitch` on `return` |
+| Sign a person in (a backend) | navigate to `GET /authorize?client_id&redirect_uri&state` | 302 to `redirect_uri?code&state` | Twitch first, then the same; failure: `?error&state` |
+| Get a code without a redirect | `POST /v1/codes {client_id}` + CSRF | `200 {code}` | `401 signed_out` |
+| Check the session (a site) | `GET /v1/me` | `200` user + `csrf` + `expiresAt` | `401 {"error":"signed_out"}` |
+| Check the session (a backend) | `GET /v1/sessions/{sid}` (Basic) | `200 {active: true, user, expiresAt}` | `200 {active: false}` |
+| Sign out | `POST /v1/logout[?everywhere=1]` + CSRF | `204` | `204` |
+| Read progress | `GET /v1/progress`, `GET /v1/progress/{vodId}` | `200 {items}` / the entry (`404 not_found`) | `401 signed_out` |
+| Write progress | `PUT /v1/progress/{vodId}`, `POST /v1/progress/merge` + CSRF | `200` the saved entry / `{items}` | `401 signed_out` |
+
 ### Forget me: what goes and what stays
 
 `DELETE /v1/me` (the "Forget me" button on vexoul.net/account) does this, in order:
@@ -66,7 +84,7 @@ Writes need the `X-Vex-CSRF` header with the `csrf` from `/v1/me`.
 3. Deletes the user. That takes their Twitch tokens, every session (on every device), one-time codes and
    watch progress with it.
 
-The backends find out through `GET /v1/sessions/{sid}`, which now answers 404: the VOD archive's admin
+The backends find out through `GET /v1/sessions/{sid}`, which now answers `200 {"active": false}`: the VOD archive's admin
 drops its session at its next check (at most a minute later); the bot's admin checks the same way.
 
 **Not deleted**, because it isn't this service's data:

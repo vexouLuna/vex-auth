@@ -140,7 +140,7 @@ async def test_signing_in_again_ends_the_previous_session(h: Harness) -> None:
     ]
     await h.sign_in(BOB)
     assert (await h.me()).json()["login"] == "bob"
-    assert (await h.http.get(f"/v1/sessions/{sid}", headers=VODS)).status_code == 404
+    assert (await h.http.get(f"/v1/sessions/{sid}", headers=VODS)).json() == {"active": False}
 
 
 # ── sign out ─────────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ async def test_sign_out_everywhere_reaches_other_browsers_and_the_backends(h: Ha
     resp = await phone.http.post("/v1/logout?everywhere=1", headers={CSRF_HEADER: await csrf(phone)})
     assert resp.status_code == 204
     resp = await h.http.get(f"/v1/sessions/{sid}", headers=VODS)
-    assert resp.status_code == 404 and resp.json() == {"active": False}
+    assert resp.status_code == 200 and resp.json() == {"active": False}
     assert (await h.me()).status_code == 401
     assert (await phone.me()).status_code == 401
 
@@ -261,7 +261,7 @@ async def test_a_backend_only_sees_its_own_sessions(h: Harness) -> None:
     body = await code_for(h, "vods-admin", VODS_REDIRECT)
     sid = (await h.http.post("/v1/token", headers=VODS, json=body)).json()["sid"]
     assert (await h.http.get(f"/v1/sessions/{sid}", headers=VODS)).status_code == 200
-    assert (await h.http.get(f"/v1/sessions/{sid}", headers=DTP)).status_code == 404
+    assert (await h.http.get(f"/v1/sessions/{sid}", headers=DTP)).json() == {"active": False}
 
 
 async def dtp_sign_in(h: Harness) -> str:
@@ -341,3 +341,24 @@ async def test_readyz_is_503_without_the_database() -> None:
     await engine.dispose()
     assert resp.status_code == 503
     assert "database" in resp.text
+
+
+async def test_failures_in_the_browser_are_a_page_with_a_way_back(h: Harness) -> None:
+    resp = await h.http.get("/login", params={"return": "https://evil.example/x"})
+    assert resp.status_code == 400 and resp.headers["content-type"].startswith("text/html")
+    assert 'href="https://vexoul.net"' in resp.text
+    resp = await h.http.get("/callback", params={"state": "unknown"})
+    assert resp.status_code == 400 and "<h1>This sign-in has expired</h1>" in resp.text
+
+
+async def test_the_api_docs_are_published(h: Harness) -> None:
+    spec = (await h.http.get("/openapi.json")).json()
+    assert spec["info"]["title"] == "vex-auth" and "/v1/sessions/{sid}" in spec["paths"]
+    assert (await h.http.get("/docs")).status_code == 200
+
+
+async def test_the_error_page_falls_back_to_the_configured_home(engine: AsyncEngine) -> None:
+    app = create_app(make_settings(home_url="https://home.test"), twitch=FakeTwitch(), engine=engine)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://auth.test") as http:
+        resp = await http.get("/login", params={"return": "https://evil.example/x"})
+    assert 'href="https://home.test"' in resp.text

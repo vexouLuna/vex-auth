@@ -36,7 +36,7 @@ async def test_a_fetched_code_signs_the_backend_in_and_keeps_answering(h: Harnes
     status = await h.http.get(f"/v1/sessions/{sid}", headers=VODS)
     assert status.status_code == 200 and status.json()["active"] is True
     assert status.json()["user"]["id"] == ALICE.id
-    assert (await h.http.get(f"/v1/sessions/{sid}", headers=DTP)).status_code == 404  # still its own only
+    assert (await h.http.get(f"/v1/sessions/{sid}", headers=DTP)).json() == {"active": False}  # still its own only
     # And sign out reaches it, as it reaches any backend.
     await h.http.post("/v1/logout", headers=hd)
     assert (await h.http.get(f"/v1/sessions/{sid}", headers=VODS)).json() == {"active": False}

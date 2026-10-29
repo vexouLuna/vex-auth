@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     # Comma-separated origins of the sites: the only pages that may read /v1/* with the session cookie,
     # and the only places /login sends people back to.
     site_origins: str = "http://localhost:5173"
+    # Where an error page's "Back to" link goes when the failed sign-in doesn't say which site started it.
+    home_url: str = "https://vexoul.net"
     # The backends, as a JSON list of {id, secret, redirect_uris, scopes}. Either inline or in a file
     # (a mounted secret); the file wins when both are set.
     clients: SecretStr = SecretStr("[]")
