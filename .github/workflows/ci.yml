@@ -8,20 +8,20 @@ on:
 
 jobs:
   conventions:
-    uses: vexouLuna/conventions/.github/workflows/conventions-check.yml@v3.0.0
+    uses: vexouLuna/conventions/.github/workflows/conventions-check.yml@v3.2.0
     secrets:
       CONVENTIONS_PRIVATE_PATTERNS: ${{ secrets.CONVENTIONS_PRIVATE_PATTERNS }}
 
   ci:
     # The suite runs against a real Postgres, the same major as compose.yaml, and includes the
     # migrations: every revision is applied, downgraded to nothing, and applied again.
-    uses: vexouLuna/conventions/.github/workflows/python-ci.yml@v3.0.0
+    uses: vexouLuna/conventions/.github/workflows/python-ci.yml@v3.2.0
     with:
       postgres: true
 
   image:
     needs: ci
-    uses: vexouLuna/conventions/.github/workflows/publish-image.yml@v3.0.0
+    uses: vexouLuna/conventions/.github/workflows/publish-image.yml@v3.2.0
     permissions:
       contents: read
       packages: write
