@@ -54,6 +54,29 @@ one-time code, like any OAuth provider.
 
 Writes need the `X-Vex-CSRF` header with the `csrf` from `/v1/me`.
 
+### `/v2`: the same routes in the wire conventions
+
+`/v1` is **legacy**: it keeps the shapes above and below (camelCase, `{error}` bodies, `X-Vex-CSRF`,
+epoch-ms `updatedAt`) until every site and backend has moved, and new routes never copy it. Every `/v1`
+route has a `/v2` twin that follows [`.conventions/API.md`](.conventions/API.md):
+
+- **Fields** are snake_case and timestamps are ISO 8601 UTC ending in `Z`: `/v2/me` is
+  `{id, login, display_name, avatar, color, created_at, csrf, expires_at}`.
+- **Progress** is `{vod_id, position_seconds, duration_seconds, updated_at}`. `PUT /v2/progress/{vod_id}`
+  takes `{position_seconds, duration_seconds, updated_at}`, where `updated_at` must carry its zone.
+  `GET /v2/progress?limit=&cursor=` is `{items, next_cursor}` (50 a page, at most 500), newest first.
+  `POST /v2/progress/merge` takes `{items: [...]}` and answers 204; read the result back with `GET`.
+- **Writes** send the session's `csrf` as `X-CSRF-Token`.
+- **Errors** are `application/problem+json`: `{type, title, status, code, detail?, request_id}`. `code`
+  is the same stable code `/v1` sends as `error` (`signed_out`, `csrf`, `scope_missing`, ...). A body
+  or query that doesn't validate is 422 `invalid` with `errors: [{loc, msg, type}]`. A cursor this
+  service didn't issue is 400 `bad_cursor`.
+- **Backends:** `POST /v2/token` → `{user, sid, expires_at}`, `GET /v2/sessions/{sid}` →
+  `{active, user?, expires_at?}`, and `GET /v2/users/{id}/moderated-channels` → `{items, next_cursor}`.
+- Every response, on either version, carries `X-Request-ID` (kept from the request when it is sane).
+
+`/login`, `/authorize`, `/callback`, `/healthz` and `/readyz` have no version and stay as they are.
+
 Interactive docs are at `/docs` and the OpenAPI spec at `/openapi.json`. Errors are
 `{"error": "<code>"}`; a refused input (`invalid_request`, `invalid_progress`) also carries
 `"field"` (which input) and `"message"` (why), never its value. A failure a person sees in the browser

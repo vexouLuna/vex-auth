@@ -15,6 +15,10 @@ Backends (registered clients, HTTP Basic with their id and secret):
   GET  /v1/sessions/{sid}               is that session still alive (how sign out everywhere reaches them)
   GET  /v1/users/{id}/moderated-channels   for clients registered with that scope
 
+/v2/... has the same routes in the shape of .conventions/API.md: snake_case, UTC timestamps ending in Z,
+lists as {items, next_cursor}, problem details for errors and X-CSRF-Token on writes. /v1 is legacy and
+keeps its shapes until every caller has moved.
+
 The session is a host-only cookie on this service's own host. Sites are same-site with it, so their
 credentialed fetches carry it; CORS lets only the configured site origins read the answers.
 """
@@ -24,22 +28,26 @@ import base64
 import binascii
 import hashlib
 import html
+import json
+import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from http import HTTPStatus
+from typing import Annotated, Any, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Query, Request, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import (
     Result,
     Row,
@@ -52,6 +60,7 @@ from sqlalchemy import (
     insert,
     literal,
     literal_column,
+    or_,
     select,
     text,
     update,
@@ -59,6 +68,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vex_auth import __version__
 from vex_auth.config import EXTRA_SCOPES, Client, Settings, origin_of
@@ -75,7 +85,10 @@ from vex_auth.twitch import (
 
 log = structlog.get_logger(__name__)
 
-CSRF_HEADER = "X-Vex-CSRF"
+CSRF_HEADER = "X-Vex-CSRF"  # /v1
+CSRF_HEADER_V2 = "X-CSRF-Token"
+REQUEST_ID_HEADER = "X-Request-ID"
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")  # an incoming id is kept only when it matches
 READY_TIMEOUT_S = 5  # /readyz: a database slower than this counts as down
 STATE_TTL = timedelta(minutes=10)
 CODE_TTL = timedelta(seconds=60)
@@ -84,6 +97,9 @@ MODERATED_SCOPE = "user:read:moderated_channels"
 PROGRESS_MAX = 5000  # per user; the oldest go first
 MERGE_MAX = 500  # entries in one merge
 VOD_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,100}$"
+PAGE_DEFAULT, PAGE_MAX = 50, 500  # /v2 lists
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+INVALID = "The request did not validate."
 HOME_URL = "https://vexoul.net"  # where an error page sends someone it can't place
 
 
@@ -205,11 +221,126 @@ class ModeratedChannels(BaseModel):
     channels: list[Any]
 
 
+# ── /v2 models ─────────────────────────────────────────────────────────────────
+
+
+class V2In(BaseModel):
+    """A /v2 request body: an unknown field is a 422, not ignored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ProgressV2In(V2In):
+    position_seconds: float = Field(ge=0, allow_inf_nan=False)
+    duration_seconds: float = Field(ge=0, allow_inf_nan=False)
+    updated_at: AwareDatetime = Field(ge=EPOCH, description="ISO 8601 with a zone; newest wins")
+
+
+class ProgressV2Item(ProgressV2In):
+    vod_id: str = Field(pattern=VOD_ID_PATTERN)
+
+
+class ProgressV2Merge(V2In):
+    items: list[ProgressV2Item] = Field(max_length=MERGE_MAX)
+
+
+class ProblemOut(BaseModel):
+    """RFC 9457 problem details, served as application/problem+json."""
+
+    type: str = "about:blank"
+    title: str
+    status: int
+    code: str = Field(description="A stable code, e.g. signed_out, csrf, invalid, bad_cursor")
+    detail: str | None = None
+    request_id: str | None = Field(None, description="The response's X-Request-ID")
+    errors: list[dict[str, Any]] | None = Field(None, description="invalid: [{loc, msg, type}]")
+
+
+class UserV2Out(BaseModel):
+    id: str
+    login: str
+    display_name: str
+    avatar: str | None
+    color: str | None
+
+
+class MeV2Out(UserV2Out):
+    created_at: str = Field(description="ISO 8601 UTC")
+    csrf: str = Field(description="Send as X-CSRF-Token on every write")
+    expires_at: str = Field(description="ISO 8601 UTC; when this session ends")
+
+
+class ProgressV2Out(BaseModel):
+    vod_id: str
+    position_seconds: float
+    duration_seconds: float
+    updated_at: str = Field(description="ISO 8601 UTC")
+
+
+class ProgressPage(BaseModel):
+    items: list[ProgressV2Out]
+    next_cursor: str | None = Field(description="Pass as ?cursor= for the next page; null on the last")
+
+
+class TokenV2Out(BaseModel):
+    user: UserV2Out
+    sid: str = Field(description="The session id; ask GET /v2/sessions/{sid} whether it is still alive")
+    expires_at: str = Field(description="ISO 8601 UTC")
+
+
+class SessionStatusV2(BaseModel):
+    active: bool
+    user: UserV2Out | None = None
+    expires_at: str | None = Field(None, description="ISO 8601 UTC")
+
+
+class ChannelsPage(BaseModel):
+    items: list[Any]
+    next_cursor: None = None
+
+
 FAIL = {"model": ErrorOut}
+PROBLEM = {"model": ProblemOut, "content": {"application/problem+json": {}}}
 
 
 def _error(status: int, error: str, **extra: Any) -> JSONResponse:
     return JSONResponse({"error": error, **extra}, status_code=status)
+
+
+def _v2(request: Request) -> bool:
+    return request.url.path.startswith("/v2/")
+
+
+def fail(
+    request: Request, status: int, error: str, errors: list[dict[str, Any]] | None = None, **extra: Any
+) -> JSONResponse:
+    """An error in the shape of the request's version: /v1's `{error, [field, message]}`, or /v2's problem
+    details, whose `detail` is /v1's `message`."""
+    if not _v2(request):
+        return _error(status, error, **extra)
+    body: dict[str, Any] = {"type": "about:blank", "title": HTTPStatus(status).phrase, "status": status, "code": error}
+    if message := extra.get("message"):
+        body["detail"] = message
+    if rid := getattr(request.state, "request_id", None):
+        body["request_id"] = rid
+    if errors is not None:
+        body["errors"] = errors
+    return JSONResponse(body, status_code=status, media_type="application/problem+json")
+
+
+def _errors(errors: Sequence[Any], where: str | None = None) -> list[dict[str, Any]]:
+    """/v2's `errors[]`: where each input failed and why, never its value."""
+    prefix = [where] if where else []
+    return [{"loc": [*prefix, *e["loc"]], "msg": str(e["msg"]), "type": str(e["type"])} for e in errors]
+
+
+def _utc(value: datetime, timespec: str = "auto") -> str:
+    """ISO 8601 in UTC ending in Z, as /v2 writes every timestamp."""
+    return value.astimezone(UTC).isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def _encode_cursor(key: list[Any]) -> str:
+    return base64.urlsafe_b64encode(json.dumps(key, separators=(",", ":")).encode()).rstrip(b"=").decode()
 
 
 ERROR_PAGE = """<!doctype html>
@@ -252,14 +383,28 @@ def error_page(status: int, title: str, message: str, back_to: str | None, home:
 
 
 class Refused(Exception):
-    """Raised by a guard or a body parser; answered as `_error(status, error)`."""
+    """Raised by a guard or a body parser; answered as `fail(request, status, error)`. `errors` is /v2's
+    list of validation errors, which /v1 leaves out."""
 
-    def __init__(self, status: int, error: str, **extra: Any) -> None:
+    def __init__(self, status: int, error: str, *, errors: list[dict[str, Any]] | None = None, **extra: Any) -> None:
         super().__init__(error)
-        self.status, self.error, self.extra = status, error, extra
+        self.status, self.error, self.errors, self.extra = status, error, errors, extra
 
 
-def _field_error(errors: Sequence[Any]) -> dict[str, str]:
+def _decode_cursor(value: str | None) -> tuple[int, str] | None:
+    """A /v2 progress cursor: [updated_at in epoch ms, vod id] of the last entry sent."""
+    if not value:
+        return None
+    try:
+        key = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+    except (binascii.Error, ValueError):
+        key = None
+    if not (isinstance(key, list) and len(key) == 2 and type(key[0]) is int and isinstance(key[1], str)):
+        raise Refused(400, "bad_cursor", message="The cursor is not one this API issued.")
+    return key[0], key[1]
+
+
+def _field_error(errors: Sequence[Any]) -> dict[str, Any]:
     """`field` and `message` of the first validation error: which input failed and why, never its value."""
     first = errors[0]
     loc = [str(p) for p in first["loc"] if p not in ("body", "query")]
@@ -271,12 +416,18 @@ def json_body[M: BaseModel](model: type[M], status: int, error: str) -> Callable
 
     Not a plain body parameter: FastAPI validates those only after every dependency has run, and a bad
     body is refused before the session guard looks at the request (so it never counts against a limit).
-    An endpoint declares it before its guard."""
+    An endpoint declares it before its guard. Under /v2 an unknown field is refused too, and every
+    failure is a 422 `invalid`."""
+    config = {**model.model_config, "extra": "forbid"}
+    strict = cast("type[M]", type(model.__name__, (model,), {"model_config": config}))
 
     async def parse(request: Request) -> M:
+        v2 = _v2(request)
         try:
-            return model.model_validate_json(await request.body())
+            return (strict if v2 else model).model_validate_json(await request.body())
         except ValidationError as exc:
+            if v2:
+                raise Refused(422, "invalid", errors=_errors(exc.errors(), "body"), message=INVALID) from None
             raise Refused(status, error, **_field_error(exc.errors())) from None
 
     return parse
@@ -287,6 +438,8 @@ merge_body = json_body(ProgressMerge, 422, "invalid_progress")
 token_body = json_body(TokenIn, 400, "invalid_request")
 code_body = json_body(CodeIn, 400, "invalid_request")
 forget_body = json_body(ForgetIn, 400, "invalid_request")
+progress_v2_body = json_body(ProgressV2In, 422, "invalid")  # /v2 only: always answered as `invalid`
+merge_v2_body = json_body(ProgressV2Merge, 422, "invalid")
 
 
 async def progress_item(vod_id: str, body: Annotated[ProgressIn, Depends(progress_body)]) -> ProgressItem:
@@ -294,6 +447,23 @@ async def progress_item(vod_id: str, body: Annotated[ProgressIn, Depends(progres
         return ProgressItem(vodId=vod_id, **body.model_dump())
     except ValidationError as exc:
         raise Refused(422, "invalid_progress", **_field_error(exc.errors())) from None
+
+
+async def progress_v2_item(vod_id: str, body: Annotated[ProgressV2In, Depends(progress_v2_body)]) -> ProgressV2Item:
+    try:
+        return ProgressV2Item(vod_id=vod_id, **body.model_dump())
+    except ValidationError as exc:
+        raise Refused(422, "invalid", errors=_errors(exc.errors(), "path"), message=INVALID) from None
+
+
+def _v1_item(item: ProgressV2Item) -> ProgressItem:
+    """A /v2 entry as it is stored: epoch ms, the browser's clock."""
+    return ProgressItem(
+        vodId=item.vod_id,
+        t=item.position_seconds,
+        duration=item.duration_seconds,
+        updatedAt=round(item.updated_at.timestamp() * 1000),
+    )
 
 
 async def progress_limit(request: Request) -> int:
@@ -316,6 +486,26 @@ def _user_json(row: Any) -> dict[str, Any]:
 def _progress_json(row: Any) -> dict[str, Any]:
     m = row._mapping  # not row.t: Row has a .t of its own
     return {"vodId": m["vod_id"], "t": m["t"], "duration": m["duration"], "updatedAt": m["updated_at"]}
+
+
+def _user_v2(row: Any) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "login": row.login,
+        "display_name": row.display_name,
+        "avatar": row.avatar,
+        "color": row.color,
+    }
+
+
+def _progress_v2(row: Any) -> dict[str, Any]:
+    m = row._mapping
+    return {
+        "vod_id": m["vod_id"],
+        "position_seconds": m["t"],
+        "duration_seconds": m["duration"],
+        "updated_at": _utc(datetime.fromtimestamp(m["updated_at"] / 1000, UTC), "milliseconds"),
+    }
 
 
 def create_app(
@@ -363,26 +553,47 @@ def create_app(
             "The Twitch sign-in shared by every vexoul.net site, and per-user data (watch progress). "
             "Sites call it from the browser with credentials (cookie + `X-Vex-CSRF` on writes); registered "
             "backends use `/authorize`, `/v1/token` and `/v1/sessions/{sid}` with HTTP Basic. "
-            "Errors are `{error, [field, message]}`; `error` is a stable code."
+            "Errors are `{error, [field, message]}`; `error` is a stable code. "
+            "`/v2` has the same routes in the workspace's wire conventions: snake_case, UTC timestamps "
+            "ending in Z, `{items, next_cursor}` lists, `application/problem+json` errors with a stable "
+            "`code`, and `X-CSRF-Token` on writes. `/v1` is legacy."
         ),
         lifespan=lifespan,
     )
 
     @app.exception_handler(Refused)
-    async def refused(_: Request, exc: Refused) -> Response:
-        return _error(exc.status, exc.error, **exc.extra)
+    async def refused(request: Request, exc: Refused) -> Response:
+        return fail(request, exc.status, exc.error, exc.errors, **exc.extra)
 
     @app.exception_handler(RequestValidationError)
-    async def invalid(_: Request, exc: RequestValidationError) -> Response:
+    async def invalid(request: Request, exc: RequestValidationError) -> Response:
+        if _v2(request):
+            return fail(request, 422, "invalid", _errors(exc.errors()), message=INVALID)
         # this service's error shape, not FastAPI's list of errors
         return _error(422, "invalid_request", **_field_error(exc.errors()))
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException) -> Response:
+        if not _v2(request):
+            return await http_exception_handler(request, exc)
+        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "error")
+        return fail(request, exc.status_code, code)
+
+    @app.middleware("http")
+    async def request_id(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        rid = request.headers.get(REQUEST_ID_HEADER, "")
+        request.state.request_id = rid if REQUEST_ID_PATTERN.match(rid) else secrets.token_hex(16)
+        resp = await call_next(request)
+        resp.headers[REQUEST_ID_HEADER] = request.state.request_id
+        return resp
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=sorted(settings.origins),
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["Content-Type", CSRF_HEADER],
+        allow_headers=["Content-Type", CSRF_HEADER, CSRF_HEADER_V2],
+        expose_headers=[REQUEST_ID_HEADER],
         max_age=600,
     )
 
@@ -629,7 +840,7 @@ def create_app(
     WriteConn = Annotated[AsyncConnection, Depends(writing, scope="function")]  # noqa: N806
 
     def check_csrf(request: Request, sess: Session) -> None:
-        sent = request.headers.get(CSRF_HEADER, "")
+        sent = request.headers.get(CSRF_HEADER_V2 if _v2(request) else CSRF_HEADER, "")
         if not secrets.compare_digest(sent, sess.csrf):
             raise Refused(403, "csrf")
 
@@ -807,6 +1018,9 @@ def create_app(
         set_session_cookie(resp, cookie, sess.expires_at)
         return resp
 
+    # A route serving /v1 and /v2 alike shapes its answer and its errors by the path it was called on.
+
+    @app.get("/v2/me", response_model=MeV2Out, responses={401: PROBLEM}, tags=["browser"])
     @app.get("/v1/me", response_model=MeOut, responses={401: FAIL}, tags=["browser"])
     async def me(request: Request, conn: ReadConn) -> Response:
         # require_session's lookup and the user in one query
@@ -828,6 +1042,15 @@ def create_app(
         )
         if row is None:
             raise Refused(401, "signed_out")
+        if _v2(request):
+            return JSONResponse(
+                {
+                    **_user_v2(row),
+                    "created_at": _utc(row.created_at),
+                    "csrf": row.csrf,
+                    "expires_at": _utc(row.expires_at),
+                }
+            )
         return JSONResponse(
             {
                 **_user_json(row),
@@ -846,6 +1069,9 @@ def create_app(
             return "undecryptable"
         return "none" if held is None else await revoke_tokens(user_id, held)
 
+    @app.delete(
+        "/v2/me", status_code=204, responses={401: PROBLEM, 400: PROBLEM, 403: PROBLEM, 422: PROBLEM}, tags=["browser"]
+    )
     @app.delete("/v1/me", status_code=204, responses={400: FAIL, 401: FAIL, 403: FAIL}, tags=["browser"])
     async def forget_me(
         request: Request, body: Annotated[ForgetIn, Depends(forget_body)], sess: WriteSession, conn: WriteConn
@@ -855,7 +1081,7 @@ def create_app(
         log keeps their events under a random `anon-` id with no IP address and no login."""
         login = await conn.scalar(select(users.c.login).where(users.c.id == sess.user_id))
         if body.confirm.strip().lower() != (login or "").lower():
-            return _error(400, "confirm_mismatch")
+            return fail(request, 400, "confirm_mismatch")
         revoked = await revoke_grant(sess.user_id, conn)
         anon = f"anon-{secrets.token_hex(8)}"  # not a Twitch id: those are digits
         without_login = audit.c.detail.op("-", return_type=JSONB)(literal("login", Text))
@@ -878,6 +1104,7 @@ def create_app(
         resp.delete_cookie(session_cookie, path="/", secure=secure, httponly=True, samesite="lax")
         return resp
 
+    @app.post("/v2/logout", status_code=204, responses={403: PROBLEM}, tags=["browser"])
     @app.post("/v1/logout", status_code=204, responses={403: FAIL}, tags=["browser"])
     async def logout(
         request: Request, sess: Annotated[Session | None, Depends(signing_out)], conn: WriteConn
@@ -895,6 +1122,12 @@ def create_app(
         return resp
 
     @app.post(
+        "/v2/codes",
+        response_model=CodeOut,
+        responses={400: PROBLEM, 401: PROBLEM, 403: PROBLEM, 409: PROBLEM, 422: PROBLEM},
+        tags=["browser"],
+    )
+    @app.post(
         "/v1/codes", response_model=CodeOut, responses={400: FAIL, 401: FAIL, 403: FAIL, 409: FAIL}, tags=["browser"]
     )
     async def mint_code(
@@ -909,7 +1142,7 @@ def create_app(
         the backend sends to /v1/token. Any script on a site origin can mint one, but that gives it nothing
         it couldn't do already by calling that site's own backend same-origin."""
         if not client.scopes <= await token_scopes(conn, sess.user_id):
-            return _error(409, "scope_missing")  # needs Twitch: the browser goes through /authorize
+            return fail(request, 409, "scope_missing")  # needs Twitch: the browser goes through /authorize
         code = await issue_code(conn, client, client.default_redirect_uri, sess)
         await record(conn, "code.issued", request, user_id=sess.user_id, client_id=client.id, via="fetch")
         return JSONResponse({"code": code})
@@ -1014,18 +1247,90 @@ def create_app(
         await upsert_progress(conn, sess.user_id, body.items)
         return JSONResponse({"items": await progress_list(conn, sess.user_id, PROGRESS_MAX)})
 
+    @app.delete("/v2/progress", status_code=204, responses={401: PROBLEM, 403: PROBLEM}, tags=["progress"])
     @app.delete("/v1/progress", status_code=204, responses={401: FAIL, 403: FAIL}, tags=["progress"])
     async def progress_clear(sess: WriteSession, conn: WriteConn) -> Response:
         await conn.execute(delete(progress).where(progress.c.user_id == sess.user_id))
         return Response(status_code=204)
 
+    @app.delete("/v2/progress/{vod_id}", status_code=204, responses={401: PROBLEM, 403: PROBLEM}, tags=["progress"])
     @app.delete("/v1/progress/{vod_id}", status_code=204, responses={401: FAIL, 403: FAIL}, tags=["progress"])
     async def progress_delete(vod_id: str, sess: WriteSession, conn: WriteConn) -> Response:
         await conn.execute(delete(progress).where(progress.c.user_id == sess.user_id, progress.c.vod_id == vod_id))
         return Response(status_code=204)
 
+    # /v2 progress: the same entries, paged newest first by (updated_at, vod_id).
+
+    async def progress_page(conn: AsyncConnection, user_id: str, limit: int, cursor: str | None) -> dict[str, Any]:
+        query = select(progress).where(progress.c.user_id == user_id)
+        if after := _decode_cursor(cursor):
+            query = query.where(
+                or_(
+                    progress.c.updated_at < after[0],
+                    and_(progress.c.updated_at == after[0], progress.c.vod_id > after[1]),
+                )
+            )
+        rows = list(
+            await conn.execute(query.order_by(progress.c.updated_at.desc(), progress.c.vod_id).limit(limit + 1))
+        )
+        more, rows = len(rows) > limit, rows[:limit]
+        last = rows[-1]._mapping if rows else None
+        return {
+            "items": [_progress_v2(r) for r in rows],
+            "next_cursor": _encode_cursor([last["updated_at"], last["vod_id"]]) if more and last else None,
+        }
+
+    @app.get(
+        "/v2/progress",
+        response_model=ProgressPage,
+        responses={400: PROBLEM, 401: PROBLEM, 422: PROBLEM},
+        tags=["progress"],
+    )
+    async def progress_index_v2(
+        sess: ReadSession,
+        conn: ReadConn,
+        limit: Annotated[
+            int, Query(ge=1, le=PAGE_MAX, description=f"Entries per page (max {PAGE_MAX})")
+        ] = PAGE_DEFAULT,
+        cursor: str | None = None,
+    ) -> Response:
+        return JSONResponse(await progress_page(conn, sess.user_id, limit, cursor))
+
+    @app.get(
+        "/v2/progress/{vod_id}", response_model=ProgressV2Out, responses={401: PROBLEM, 404: PROBLEM}, tags=["progress"]
+    )
+    async def progress_get_v2(vod_id: str, request: Request, sess: ReadSession, conn: ReadConn) -> Response:
+        row = await progress_row(conn, sess.user_id, vod_id)
+        return JSONResponse(_progress_v2(row)) if row else fail(request, 404, "not_found")
+
+    @app.put(
+        "/v2/progress/{vod_id}",
+        response_model=ProgressV2Out,
+        responses={401: PROBLEM, 403: PROBLEM, 422: PROBLEM},
+        tags=["progress"],
+    )
+    async def progress_put_v2(
+        item: Annotated[ProgressV2Item, Depends(progress_v2_item)], sess: WriteSession, conn: WriteConn
+    ) -> Response:
+        written = await upsert_progress(conn, sess.user_id, [_v1_item(item)])
+        row = written.get(item.vod_id) or await progress_row(conn, sess.user_id, item.vod_id)  # stale or trimmed
+        return JSONResponse(_progress_v2(row)) if row else Response(status_code=204)
+
+    @app.post(
+        "/v2/progress/merge", status_code=204, responses={401: PROBLEM, 403: PROBLEM, 422: PROBLEM}, tags=["progress"]
+    )
+    async def progress_merge_v2(
+        body: Annotated[ProgressV2Merge, Depends(merge_v2_body)], sess: WriteSession, conn: WriteConn
+    ) -> Response:
+        """Many entries at once, newest winning each. Read the result back with GET /v2/progress."""
+        await upsert_progress(conn, sess.user_id, [_v1_item(i) for i in body.items])
+        return Response(status_code=204)
+
     # ── backends ───────────────────────────────────────────────────────────────
 
+    @app.post(
+        "/v2/token", response_model=TokenV2Out, responses={400: PROBLEM, 401: PROBLEM, 422: PROBLEM}, tags=["backend"]
+    )
     @app.post("/v1/token", response_model=TokenOut, responses={400: FAIL, 401: FAIL}, tags=["backend"])
     async def token(request: Request, client: Backend, body: Annotated[TokenIn, Depends(token_body)]) -> Response:
         async with db.begin() as conn:
@@ -1044,25 +1349,36 @@ def create_app(
                 or row.redirect_uri != body.redirect_uri
                 or row.expires_at <= now
             ):
-                return _error(400, "invalid_grant")
+                return fail(request, 400, "invalid_grant")  # returned, not raised: the code stays used
             found = await live_session_user(conn, row.session_id, now)
             if found is None:
-                return _error(400, "invalid_grant")
+                return fail(request, 400, "invalid_grant")
             await record(conn, "code.redeemed", request, user_id=row.user_id, client_id=client.id)
+        if _v2(request):
+            return JSONResponse({"user": _user_v2(found), "sid": row.session_id, "expires_at": _utc(found.expires_at)})
         return JSONResponse(
             {"user": _user_json(found), "sid": row.session_id, "expiresAt": found.expires_at.isoformat()}
         )
 
+    @app.get("/v2/sessions/{sid}", response_model=SessionStatusV2, responses={401: PROBLEM}, tags=["backend"])
     @app.get("/v1/sessions/{sid}", response_model=SessionStatus, responses={401: FAIL}, tags=["backend"])
-    async def session_status(sid: str, client: Backend) -> Response:
+    async def session_status(sid: str, request: Request, client: Backend) -> Response:
         async with db.connect() as conn:
             if not await has_signed_into(conn, client, sid=sid):
                 return JSONResponse({"active": False})
             found = await live_session_user(conn, sid, clock())
         if found is None:
             return JSONResponse({"active": False})
+        if _v2(request):
+            return JSONResponse({"active": True, "user": _user_v2(found), "expires_at": _utc(found.expires_at)})
         return JSONResponse({"active": True, "user": _user_json(found), "expiresAt": found.expires_at.isoformat()})
 
+    @app.get(
+        "/v2/users/{user_id}/moderated-channels",
+        response_model=ChannelsPage,
+        responses={401: PROBLEM, 403: PROBLEM, 404: PROBLEM, 409: PROBLEM, 410: PROBLEM, 502: PROBLEM},
+        tags=["backend"],
+    )
     @app.get(
         "/v1/users/{user_id}/moderated-channels",
         response_model=ModeratedChannels,
@@ -1071,13 +1387,13 @@ def create_app(
     )
     async def moderated_channels(user_id: str, request: Request, client: Backend) -> Response:
         if MODERATED_SCOPE not in client.scopes:
-            return _error(403, "scope_not_allowed")
+            return fail(request, 403, "scope_not_allowed")
         async with db.connect() as conn:
             if not await has_signed_into(conn, client, user_id=user_id):
-                return _error(404, "unknown_user")
+                return fail(request, 404, "unknown_user")
             row = (await conn.execute(select(twitch_tokens).where(twitch_tokens.c.user_id == user_id))).first()
         if row is None or MODERATED_SCOPE not in row.scopes:
-            return _error(409, "scope_missing")
+            return fail(request, 409, "scope_missing")
         try:
             access = fernet.decrypt(row.access_enc).decode()
             refresh = fernet.decrypt(row.refresh_enc).decode() if row.refresh_enc else None
@@ -1106,8 +1422,8 @@ def create_app(
             return await forget_token(user_id, request, client)
         except TwitchError as exc:
             log.warning("twitch.moderated_failed", user=user_id, error=str(exc))
-            return _error(502, "twitch")
-        return JSONResponse({"channels": channels})
+            return fail(request, 502, "twitch")
+        return JSONResponse({"items": channels, "next_cursor": None} if _v2(request) else {"channels": channels})
 
     async def forget_token(user_id: str, request: Request, client: Client) -> Response:
         """Twitch took the grant back. Drop the token, so the next /authorize goes through Twitch again
@@ -1115,7 +1431,7 @@ def create_app(
         async with db.begin() as conn:
             await conn.execute(delete(twitch_tokens).where(twitch_tokens.c.user_id == user_id))
             await record(conn, "token.revoked", request, user_id=user_id, client_id=client.id)
-        return _error(410, "revoked")
+        return fail(request, 410, "revoked")
 
     return app
 
