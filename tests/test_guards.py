@@ -40,9 +40,12 @@ def js(obj: Any) -> bytes:
 
 
 def answer(resp: httpx.Response) -> tuple[int, list[tuple[str, str]], bytes]:
-    """The response as compared here. A deleted cookie's `expires=` is the wall clock's, so it goes."""
+    """The response as compared here. A deleted cookie's `expires=` is the wall clock's, and X-Request-ID is
+    random, so they go."""
     headers = [
-        (k, re.sub(r"expires=[^;]*; ", "", v) if k == "set-cookie" else v) for k, v in resp.headers.multi_items()
+        (k, re.sub(r"expires=[^;]*; ", "", v) if k == "set-cookie" else v)
+        for k, v in resp.headers.multi_items()
+        if k != "x-request-id"
     ]
     body = resp.content
     if resp.headers.get("content-type") == "application/json" and "field" in resp.json():
