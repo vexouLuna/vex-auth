@@ -72,7 +72,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vex_auth import __version__
 from vex_auth.config import EXTRA_SCOPES, Client, Settings, origin_of
-from vex_auth.db import audit, codes, login_states, progress, sessions, twitch_tokens, users
+from vex_auth.db import audit, codes, login_states, progress, session_clients, sessions, twitch_tokens, users
 from vex_auth.twitch import (
     AUTHORIZE_URL,
     Profile,
@@ -664,10 +664,8 @@ def create_app(
 
     async def has_signed_into(conn: AsyncConnection, client: Client, *, sid: str = "", user_id: str = "") -> bool:
         """Whether the client was ever handed this session or user: a backend only asks about its own."""
-        where = codes.c.session_id == sid if sid else codes.c.user_id == user_id
-        found = await conn.scalar(
-            select(exists().where(and_(codes.c.client_id == client.id, codes.c.used_at.is_not(None), where)))
-        )
+        where = session_clients.c.session_id == sid if sid else session_clients.c.user_id == user_id
+        found = await conn.scalar(select(exists().where(and_(session_clients.c.client_id == client.id, where))))
         return bool(found)
 
     async def start_twitch(
@@ -686,11 +684,7 @@ def create_app(
             # Only tidiness: /callback and /v1/token check expires_at themselves.
             last_cleanup = now
             await conn.execute(delete(login_states).where(login_states.c.expires_at <= now))
-            # A used code is the record that a backend was handed the session (has_signed_into): it goes with
-            # the session, not after a day.
-            await conn.execute(
-                delete(codes).where(codes.c.used_at.is_(None), codes.c.expires_at <= now - timedelta(days=1))
-            )
+            await conn.execute(delete(codes).where(codes.c.expires_at <= now - timedelta(days=1)))
         state = secrets.token_urlsafe(24)
         await conn.execute(
             insert(login_states).values(
@@ -1357,6 +1351,11 @@ def create_app(
             found = await live_session_user(conn, row.session_id, now)
             if found is None:
                 return fail(request, 400, "invalid_grant")
+            await conn.execute(
+                pg_insert(session_clients)
+                .values(session_id=row.session_id, user_id=row.user_id, client_id=client.id)
+                .on_conflict_do_nothing()
+            )
             await record(conn, "code.redeemed", request, user_id=row.user_id, client_id=client.id)
         if _v2(request):
             return JSONResponse({"user": _user_v2(found), "sid": row.session_id, "expires_at": _utc(found.expires_at)})
