@@ -845,7 +845,7 @@ def create_app(
 
     def check_csrf(request: Request, sess: Session) -> None:
         sent = request.headers.get(CSRF_HEADER_V2 if _v2(request) else CSRF_HEADER, "")
-        if not secrets.compare_digest(sent, sess.csrf):
+        if not secrets.compare_digest(sent.encode(), sess.csrf.encode()):
             raise Refused(403, "csrf")
 
     async def require_session(request: Request, conn: ReadConn) -> Session:
@@ -992,7 +992,7 @@ def create_app(
         if row.expires_at <= clock():
             return fail("expired", "sign-in state expired")
         browser_state = request.cookies.get(state_cookie, "")
-        if not browser_state or not secrets.compare_digest(browser_state, state):
+        if not browser_state or not secrets.compare_digest(browser_state.encode(), state.encode()):
             return fail("expired", "this sign-in was started in another browser")
         if error := q.get("error"):
             return fail("denied" if error == "access_denied" else "twitch", f"Twitch returned {error}")

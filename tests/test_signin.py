@@ -364,6 +364,16 @@ async def test_the_error_page_falls_back_to_the_configured_home(engine: AsyncEng
     assert 'href="https://home.test"' in resp.text
 
 
+async def test_non_ascii_state_cookie_is_a_sign_in_error_not_a_500(h: Harness) -> None:
+    params = await h.twitch_redirect(await h.http.get("/login", params={"return": SITE + "/x"}))
+    code = h.twitch.authorize(ALICE, set(params["scope"].split()))
+    resp = await h.http.get(
+        "/callback",
+        params={"code": code, "state": params["state"]},
+        headers=[(b"cookie", b"vxa_state=" + "é".encode("latin-1"))],
+    )
+    assert resp.status_code == 302 and "auth_error=expired" in resp.headers["location"]
+
 
 async def test_a_used_code_outlives_the_cleanup_so_a_long_session_stays_active(h: Harness) -> None:
     await h.sign_in()

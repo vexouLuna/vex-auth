@@ -337,3 +337,9 @@ async def test_refusals_name_the_failing_field(h: Harness) -> None:
     resp = await h.http.post("/v1/token", headers=basic("vods-admin", "vods-secret"), json={"code": "x"})
     assert (resp.status_code, resp.json()["error"], resp.json()["field"]) == (400, "invalid_request", "redirect_uri")
     assert (await h.http.get("/v1/progress?limit=x")).json()["field"] == "limit"
+
+
+async def test_non_ascii_csrf_header_is_refused_not_a_500(h: Harness) -> None:
+    await h.sign_in()
+    resp = await h.http.post("/v1/logout", headers=[(CSRF_HEADER.encode(), "é".encode("latin-1"))])
+    assert answer(resp) == error(403, "csrf")
