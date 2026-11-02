@@ -686,7 +686,11 @@ def create_app(
             # Only tidiness: /callback and /v1/token check expires_at themselves.
             last_cleanup = now
             await conn.execute(delete(login_states).where(login_states.c.expires_at <= now))
-            await conn.execute(delete(codes).where(codes.c.expires_at <= now - timedelta(days=1)))
+            # A used code is the record that a backend was handed the session (has_signed_into): it goes with
+            # the session, not after a day.
+            await conn.execute(
+                delete(codes).where(codes.c.used_at.is_(None), codes.c.expires_at <= now - timedelta(days=1))
+            )
         state = secrets.token_urlsafe(24)
         await conn.execute(
             insert(login_states).values(

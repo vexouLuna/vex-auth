@@ -362,3 +362,15 @@ async def test_the_error_page_falls_back_to_the_configured_home(engine: AsyncEng
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://auth.test") as http:
         resp = await http.get("/login", params={"return": "https://evil.example/x"})
     assert 'href="https://home.test"' in resp.text
+
+
+
+async def test_a_used_code_outlives_the_cleanup_so_a_long_session_stays_active(h: Harness) -> None:
+    await h.sign_in()
+    sid = (await h.http.post("/v1/token", headers=VODS, json=await code_for(h, "vods-admin", VODS_REDIRECT))).json()[
+        "sid"
+    ]
+    h.clock.advance(days=2)
+    await h.http.get("/login", params={"return": SITE})  # runs the periodic cleanup
+    status = await h.http.get(f"/v1/sessions/{sid}", headers=VODS)
+    assert status.json()["active"] is True
