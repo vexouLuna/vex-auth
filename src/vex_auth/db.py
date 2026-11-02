@@ -84,6 +84,18 @@ codes = Table(
     Index("codes_expires_at", "expires_at"),
 )
 
+# Which backend redeemed a code for which session: what GET /v1/sessions/{sid} lets it ask about.
+# Kept apart from `codes`, which the cleanup empties a day after expiry.
+session_clients = Table(
+    "session_clients",
+    metadata,
+    Column("session_id", Text, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("client_id", Text, nullable=False),
+    PrimaryKeyConstraint("session_id", "client_id"),
+    Index("session_clients_client_user", "client_id", "user_id"),
+)
+
 login_states = Table(
     "login_states",
     metadata,

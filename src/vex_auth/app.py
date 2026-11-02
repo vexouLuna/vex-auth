@@ -72,7 +72,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vex_auth import __version__
 from vex_auth.config import EXTRA_SCOPES, Client, Settings, origin_of
-from vex_auth.db import audit, codes, login_states, progress, sessions, twitch_tokens, users
+from vex_auth.db import audit, codes, login_states, progress, session_clients, sessions, twitch_tokens, users
 from vex_auth.twitch import (
     AUTHORIZE_URL,
     Profile,
@@ -664,10 +664,8 @@ def create_app(
 
     async def has_signed_into(conn: AsyncConnection, client: Client, *, sid: str = "", user_id: str = "") -> bool:
         """Whether the client was ever handed this session or user: a backend only asks about its own."""
-        where = codes.c.session_id == sid if sid else codes.c.user_id == user_id
-        found = await conn.scalar(
-            select(exists().where(and_(codes.c.client_id == client.id, codes.c.used_at.is_not(None), where)))
-        )
+        where = session_clients.c.session_id == sid if sid else session_clients.c.user_id == user_id
+        found = await conn.scalar(select(exists().where(and_(session_clients.c.client_id == client.id, where))))
         return bool(found)
 
     async def start_twitch(
@@ -841,7 +839,7 @@ def create_app(
 
     def check_csrf(request: Request, sess: Session) -> None:
         sent = request.headers.get(CSRF_HEADER_V2 if _v2(request) else CSRF_HEADER, "")
-        if not secrets.compare_digest(sent, sess.csrf):
+        if not secrets.compare_digest(sent.encode(), sess.csrf.encode()):
             raise Refused(403, "csrf")
 
     async def require_session(request: Request, conn: ReadConn) -> Session:
@@ -988,7 +986,7 @@ def create_app(
         if row.expires_at <= clock():
             return fail("expired", "sign-in state expired")
         browser_state = request.cookies.get(state_cookie, "")
-        if not browser_state or not secrets.compare_digest(browser_state, state):
+        if not browser_state or not secrets.compare_digest(browser_state.encode(), state.encode()):
             return fail("expired", "this sign-in was started in another browser")
         if error := q.get("error"):
             return fail("denied" if error == "access_denied" else "twitch", f"Twitch returned {error}")
@@ -1154,6 +1152,13 @@ def create_app(
         than the one already saved, or was trimmed straight away."""
         if not items:
             return {}
+        # One row per vod: ON CONFLICT cannot touch the same row twice in a statement. The newest entry wins,
+        # a later one on a tie.
+        newest: dict[str, ProgressItem] = {}
+        for i in items:
+            if i.vodId not in newest or i.updatedAt >= newest[i.vodId].updatedAt:
+                newest[i.vodId] = i
+        items = list(newest.values())
         # Newest wins, per entry: an older write (another tab, a merge of stale local data) never undoes
         # a newer one.
         stmt = pg_insert(progress).values(
@@ -1353,6 +1358,11 @@ def create_app(
             found = await live_session_user(conn, row.session_id, now)
             if found is None:
                 return fail(request, 400, "invalid_grant")
+            await conn.execute(
+                pg_insert(session_clients)
+                .values(session_id=row.session_id, user_id=row.user_id, client_id=client.id)
+                .on_conflict_do_nothing()
+            )
             await record(conn, "code.redeemed", request, user_id=row.user_id, client_id=client.id)
         if _v2(request):
             return JSONResponse({"user": _user_v2(found), "sid": row.session_id, "expires_at": _utc(found.expires_at)})
