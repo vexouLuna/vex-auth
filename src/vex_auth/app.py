@@ -1152,6 +1152,13 @@ def create_app(
         than the one already saved, or was trimmed straight away."""
         if not items:
             return {}
+        # One row per vod: ON CONFLICT cannot touch the same row twice in a statement. The newest entry wins,
+        # a later one on a tie.
+        newest: dict[str, ProgressItem] = {}
+        for i in items:
+            if i.vodId not in newest or i.updatedAt >= newest[i.vodId].updatedAt:
+                newest[i.vodId] = i
+        items = list(newest.values())
         # Newest wins, per entry: an older write (another tab, a merge of stale local data) never undoes
         # a newer one.
         stmt = pg_insert(progress).values(

@@ -49,6 +49,18 @@ async def test_merge_imports_local_progress(h: Harness) -> None:
     assert got == {"v1": 500, "v2": 2}
 
 
+async def test_merge_with_a_repeated_vod_keeps_the_newest(h: Harness) -> None:
+    await h.sign_in()
+    items = [
+        {"vodId": "v1", "t": 7, "duration": 900, "updatedAt": 3000},
+        {"vodId": "v1", "t": 3, "duration": 900, "updatedAt": 1000},
+        {"vodId": "v2", "t": 2, "duration": 900, "updatedAt": 3000},
+    ]
+    resp = await h.http.post("/v1/progress/merge", headers=await headers(h), json={"items": items})
+    assert resp.status_code == 200, resp.text
+    assert {i["vodId"]: i["t"] for i in resp.json()["items"]} == {"v1": 7, "v2": 2}
+
+
 async def test_progress_is_per_user(h: Harness) -> None:
     await h.sign_in()
     await h.http.put("/v1/progress/v1", headers=await headers(h), json=ENTRY)
