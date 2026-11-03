@@ -141,10 +141,14 @@ class Session:
     expires_at: datetime
 
 
+# Milliseconds; 9999-12-31, past which datetime.fromtimestamp fails and /v2/progress would 500.
+MAX_UPDATED_AT = 253_402_300_799_000
+
+
 class ProgressIn(BaseModel):
     t: float = Field(ge=0, allow_inf_nan=False)
     duration: float = Field(ge=0, allow_inf_nan=False)
-    updatedAt: int = Field(ge=0)  # noqa: N815 - the sites' field name
+    updatedAt: int = Field(ge=0, le=MAX_UPDATED_AT)  # noqa: N815 - the sites' field name
 
 
 class ProgressItem(ProgressIn):
@@ -655,7 +659,7 @@ def create_app(
             return None
         try:
             client_id, _, secret = base64.b64decode(value, validate=True).decode().partition(":")
-        except (binascii.Error, UnicodeDecodeError):
+        except ValueError:  # binascii.Error, UnicodeDecodeError and the str-not-ASCII error are all ValueErrors
             return None
         client = clients.get(client_id)
         if client is None or not secrets.compare_digest(secret.encode(), client.secret.encode()):
@@ -997,6 +1001,8 @@ def create_app(
             profile = await tw.profile(token.access)
         except TwitchError as exc:
             return fail("twitch", str(exc))
+        if client and row.client_redirect_uri and row.client_redirect_uri not in client.redirect_uris:
+            return page(400, "Can't sign you in", "The app that sent you here is no longer registered.", row.return_to)
 
         async with db.begin() as conn:
             replaced = await store_user(conn, profile, token)

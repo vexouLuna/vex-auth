@@ -4,7 +4,7 @@ import base64
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from tests.conftest import ALICE, BOB, BOT_REDIRECT, SITE, VODS_REDIRECT, Clock, FakeTwitch, Harness, make_settings
@@ -384,3 +384,17 @@ async def test_a_used_code_outlives_the_cleanup_so_a_long_session_stays_active(h
     await h.http.get("/login", params={"return": SITE})  # runs the periodic cleanup
     status = await h.http.get(f"/v1/sessions/{sid}", headers=VODS)
     assert status.json()["active"] is True
+
+
+async def test_a_deregistered_redirect_uri_gets_no_code_on_callback(h: Harness, engine: AsyncEngine) -> None:
+    params = await h.twitch_redirect(await authorize(h, "dtp", BOT_REDIRECT, state="s1"))
+    async with engine.begin() as conn:  # as if it were removed from AUTH_CLIENTS while the sign-in was live
+        await conn.execute(update(login_states).values(client_redirect_uri="http://evil.test/cb"))
+    resp = await h.approve(params, ALICE)
+    assert resp.status_code == 400
+    assert "location" not in resp.headers and "evil.test" not in resp.text
+
+
+async def test_non_ascii_basic_credentials_are_invalid_client_not_a_500(h: Harness) -> None:
+    resp = await h.http.post("/v1/token", headers=[(b"authorization", "Basic é".encode("latin-1"))], json={})
+    assert resp.status_code == 401

@@ -90,6 +90,8 @@ async def test_bad_progress_is_refused(h: Harness) -> None:
     hd = await headers(h)
     for bad in ({"t": -1, "duration": 9, "updatedAt": 1}, {"t": 1, "updatedAt": 1}, {"t": "x"}):
         assert (await h.http.put("/v1/progress/v1", headers=hd, json=bad)).status_code == 422
+    far = {"t": 1, "duration": 2, "updatedAt": 10**16}
+    assert (await h.http.put("/v1/progress/v1", headers=hd, json=far)).status_code == 422
     assert (await h.http.put("/v1/progress/bad%20id", headers=hd, json=ENTRY)).status_code == 422
     too_many = [{"vodId": f"v{i}", **ENTRY} for i in range(501)]
     assert (await h.http.post("/v1/progress/merge", headers=hd, json={"items": too_many})).status_code == 422
