@@ -535,7 +535,12 @@ def create_app(
     # __Host- makes the browser insist on Secure, path=/ and no Domain: the cookie can't leak to or be
     # planted from a sibling host. Plain http in development can't have it.
     session_cookie = "__Host-vxa_session" if secure else "vxa_session"
-    state_cookie = "vxa_state"
+
+    def state_cookie(state: str) -> str:
+        # One cookie per sign-in, so two started in one browser (two tabs, /login then /authorize) don't
+        # overwrite or clear each other's.
+        return "vxa_state_" + _hash(state).hex()[:16]
+
     session_ttl = timedelta(days=settings.session_days)
     login_limit = Limiter(20, 60)
     backend_limit = Limiter(120, 60)
@@ -713,7 +718,7 @@ def create_app(
         )
         resp = RedirectResponse(f"{AUTHORIZE_URL}?{query}", status_code=302)
         resp.set_cookie(
-            state_cookie,
+            state_cookie(state),
             state,
             max_age=int(STATE_TTL.total_seconds()),
             path="/callback",
@@ -982,14 +987,14 @@ def create_app(
             else:
                 url = with_query(row.return_to or "", auth_error=reason)
             resp = RedirectResponse(url, status_code=302)
-            resp.delete_cookie(state_cookie, path="/callback")
+            resp.delete_cookie(state_cookie(state), path="/callback")
             return resp
 
         if row.client_id and client is None:
             return page(400, "Can't sign you in", "The app that sent you here is no longer registered.", row.return_to)
         if row.expires_at <= clock():
             return fail("expired", "sign-in state expired")
-        browser_state = request.cookies.get(state_cookie, "")
+        browser_state = request.cookies.get(state_cookie(state), "")
         if not browser_state or not secrets.compare_digest(browser_state.encode(), state.encode()):
             return fail("expired", "this sign-in was started in another browser")
         if error := q.get("error"):
@@ -1018,7 +1023,7 @@ def create_app(
         # A token that was replaced (Reconnect Twitch, or a sign-in asking for more scopes) has no use left.
         await revoke_tokens(profile.id, replaced)
         resp = RedirectResponse(url, status_code=302)
-        resp.delete_cookie(state_cookie, path="/callback")
+        resp.delete_cookie(state_cookie(state), path="/callback")
         set_session_cookie(resp, cookie, sess.expires_at)
         return resp
 
@@ -1415,38 +1420,64 @@ def create_app(
             refresh = fernet.decrypt(row.refresh_enc).decode() if row.refresh_enc else None
         except InvalidToken:
             log.error("token.undecryptable", user=user_id)  # AUTH_TOKEN_KEY changed: sign in again
-            return await forget_token(user_id, request, client)
+            return await forget_token(user_id, request, client, row.access_enc)
+        used = row.access_enc  # the token whose failure may drop the row
         try:
             try:
                 channels = await tw.moderated_channels(access, user_id)
             except TokenRevoked:
                 if not refresh:
                     raise
-                fresh = await tw.refresh(refresh)  # an expired access token, most likely
+                # Twitch refresh tokens are single-use: refresh one call at a time per user, and a call that
+                # waited takes the token the one before it stored instead of spending the old one again.
                 async with db.begin() as conn:
-                    await conn.execute(
-                        update(twitch_tokens)
-                        .where(twitch_tokens.c.user_id == user_id)
-                        .values(
-                            access_enc=fernet.encrypt(fresh.access.encode()),
-                            refresh_enc=fernet.encrypt((fresh.refresh or refresh).encode()),
-                            updated_at=clock(),
+                    now = (
+                        await conn.execute(
+                            select(twitch_tokens).where(twitch_tokens.c.user_id == user_id).with_for_update()
                         )
-                    )
-                channels = await tw.moderated_channels(fresh.access, user_id)
+                    ).first()
+                    if now is None:
+                        raise
+                    if now.access_enc != row.access_enc:
+                        used = now.access_enc
+                        try:
+                            access = fernet.decrypt(now.access_enc).decode()
+                        except InvalidToken:
+                            log.error("token.undecryptable", user=user_id)
+                            raise TokenRevoked("undecryptable") from None
+                    else:
+                        fresh = await tw.refresh(refresh)  # an expired access token, most likely
+                        access = fresh.access
+                        used = fernet.encrypt(access.encode())
+                        await conn.execute(
+                            update(twitch_tokens)
+                            .where(twitch_tokens.c.user_id == user_id)
+                            .values(
+                                access_enc=used,
+                                refresh_enc=fernet.encrypt((fresh.refresh or refresh).encode()),
+                                updated_at=clock(),
+                            )
+                        )
+                channels = await tw.moderated_channels(access, user_id)
         except TokenRevoked:
-            return await forget_token(user_id, request, client)
+            return await forget_token(user_id, request, client, used)
         except TwitchError as exc:
             log.warning("twitch.moderated_failed", user=user_id, error=str(exc))
             return fail(request, 502, "twitch")
         return JSONResponse({"items": channels, "next_cursor": None} if _v2(request) else {"channels": channels})
 
-    async def forget_token(user_id: str, request: Request, client: Client) -> Response:
+    async def forget_token(user_id: str, request: Request, client: Client, access_enc: bytes) -> Response:
         """Twitch took the grant back. Drop the token, so the next /authorize goes through Twitch again
-        instead of handing out a code that can't answer anything."""
+        instead of handing out a code that can't answer anything. Only the token that failed
+        (`access_enc`): one a refresh or sign-in stored meanwhile stays."""
         async with db.begin() as conn:
-            await conn.execute(delete(twitch_tokens).where(twitch_tokens.c.user_id == user_id))
-            await record(conn, "token.revoked", request, user_id=user_id, client_id=client.id)
+            gone = await conn.execute(
+                delete(twitch_tokens).where(
+                    twitch_tokens.c.user_id == user_id, twitch_tokens.c.access_enc == access_enc
+                )
+            )
+            if gone.rowcount:
+                await record(conn, "token.revoked", request, user_id=user_id, client_id=client.id)
         return fail(request, 410, "revoked")
 
     return app
