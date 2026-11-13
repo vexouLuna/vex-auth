@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from urllib.parse import parse_qs, urlsplit
 
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from tests.conftest import ALICE, BOB, BOT_REDIRECT, SITE, VODS_REDIRECT, Clock, FakeTwitch, Harness, make_settings
 from vex_auth.app import CSRF_HEADER, Limiter, create_app, with_query
 from vex_auth.db import login_states
+from vex_auth.twitch import Token, TokenRevoked
 
 MODERATED = "user:read:moderated_channels"
 
@@ -98,6 +100,16 @@ async def test_a_callback_from_another_browser_is_refused(h: Harness) -> None:
     resp = await h.another_browser().approve(params, ALICE)  # without the state cookie
     assert resp.headers["location"] == SITE + "/x?auth_error=expired"
     assert "exchange" not in h.twitch.calls
+
+
+async def test_a_failed_sign_in_leaves_another_tabs_sign_in_alone(h: Harness) -> None:
+    first = await h.twitch_redirect(await h.http.get("/login", params={"return": SITE + "/a"}))
+    second = await h.twitch_redirect(await h.http.get("/login", params={"return": SITE + "/b"}))
+    # The first tab comes back refused; that must not clear the second tab's state cookie.
+    resp = await h.http.get("/callback", params={"error": "access_denied", "state": first["state"]})
+    assert resp.headers["location"] == SITE + "/a?auth_error=denied"
+    assert (await h.approve(second, ALICE)).headers["location"] == SITE + "/b"
+    assert (await h.me()).status_code == 200
 
 
 async def test_a_state_works_once_and_expires(h: Harness) -> None:
@@ -289,6 +301,31 @@ async def test_moderated_channels_refreshes_an_expired_token(h: Harness) -> None
     h.twitch.calls.clear()
     assert (await h.http.get(f"/v1/users/{uid}/moderated-channels", headers=DTP)).status_code == 200
     assert "refresh" not in h.twitch.calls  # the refreshed token was kept
+
+
+async def test_concurrent_refreshes_keep_the_refreshed_token(h: Harness) -> None:
+    uid = await dtp_sign_in(h)
+    h.twitch.valid.clear()  # the access token expired
+    twitch = h.twitch
+
+    async def single_use_refresh(refresh_token: str) -> Token:  # Twitch rotates refresh tokens
+        twitch.calls.append("refresh")
+        await asyncio.sleep(0.05)  # both requests are in flight before either spends the token
+        if refresh_token not in twitch.refreshable:
+            raise TokenRevoked("invalid refresh token")
+        user = twitch.refreshable.pop(refresh_token)
+        twitch.n += 1
+        access, refresh = f"access-{twitch.n}", f"refresh-{twitch.n}"
+        twitch.valid.add(access)
+        twitch.refreshable[refresh] = user
+        return Token(access, refresh, frozenset())
+
+    twitch.refresh = single_use_refresh  # type: ignore[method-assign]
+    url = f"/v1/users/{uid}/moderated-channels"
+    both = await asyncio.gather(h.http.get(url, headers=DTP), h.http.get(url, headers=DTP))
+    assert [r.status_code for r in both] == [200, 200]
+    assert twitch.calls.count("refresh") == 1  # the second request took the token the first one stored
+    assert (await h.http.get(url, headers=DTP)).status_code == 200  # and the row is still there
 
 
 async def test_a_revoked_grant_is_forgotten_and_asked_for_again(h: Harness) -> None:
