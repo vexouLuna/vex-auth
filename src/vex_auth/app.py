@@ -8,6 +8,8 @@ Browsers (the sites, from their own origins, with credentials):
   POST /v1/codes {client_id}      a one-time code for that backend, without a redirect
   /v1/progress[/{vodId}]          watch progress (GET, PUT, DELETE; POST /v1/progress/merge imports many,
                                   DELETE /v1/progress clears it all)
+  /v2/presets/{kind}[/{name}]     named sets of settings per kind, /v2 only (GET the kind's list; PUT {value}
+                                  and DELETE one by name)
 
 Backends (registered clients, HTTP Basic with their id and secret):
   GET  /authorize?client_id&redirect_uri&state[&scope]   a one-time code; straight back when already signed in
@@ -42,12 +44,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import Depends, FastAPI, Query, Request, Response
+from fastapi import Depends, FastAPI, Path, Query, Request, Response
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import (
     Result,
     Row,
@@ -72,7 +74,17 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vex_auth import __version__
 from vex_auth.config import EXTRA_SCOPES, Client, Settings, origin_of
-from vex_auth.db import audit, codes, login_states, progress, session_clients, sessions, twitch_tokens, users
+from vex_auth.db import (
+    audit,
+    codes,
+    login_states,
+    presets,
+    progress,
+    session_clients,
+    sessions,
+    twitch_tokens,
+    users,
+)
 from vex_auth.twitch import (
     AUTHORIZE_URL,
     Profile,
@@ -98,6 +110,10 @@ PROGRESS_MAX = 5000  # per user; the oldest go first
 MERGE_MAX = 500  # entries in one merge
 VOD_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,100}$"
 PAGE_DEFAULT, PAGE_MAX = 50, 500  # /v2 lists
+PRESET_KIND_PATTERN = r"^[a-z0-9._-]{1,64}$"
+PRESET_NAME_MAX = 64  # characters, after stripping
+PRESET_VALUE_MAX = 4096  # bytes of compact JSON
+PRESETS_MAX = 50  # per user per kind
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 INVALID = "The request did not validate."
 HOME_URL = "https://vexoul.net"  # where an error page sends someone it can't place
@@ -286,6 +302,31 @@ class ProgressPage(BaseModel):
     next_cursor: str | None = Field(description="Pass as ?cursor= for the next page; null on the last")
 
 
+class PresetIn(BaseModel):
+    value: dict[str, Any]
+
+    @field_validator("value")
+    @classmethod
+    def _storable(cls, value: dict[str, Any]) -> dict[str, Any]:
+        encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode()) > PRESET_VALUE_MAX:
+            raise ValueError(f"value must be at most {PRESET_VALUE_MAX} bytes of JSON")
+        if re.search(r"(?<!\\)(?:\\\\)*\\u0000", encoded):  # an escaped NUL, which jsonb cannot hold
+            raise ValueError("value must not contain the NUL character")
+        return value
+
+
+class PresetOut(BaseModel):
+    name: str
+    value: dict[str, Any]
+    updated_at: str = Field(description="ISO 8601 UTC")
+
+
+class PresetPage(BaseModel):
+    items: list[PresetOut]
+    next_cursor: None = None
+
+
 class TokenV2Out(BaseModel):
     user: UserV2Out
     sid: str = Field(description="The session id; ask GET /v2/sessions/{sid} whether it is still alive")
@@ -444,6 +485,19 @@ code_body = json_body(CodeIn, 400, "invalid_request")
 forget_body = json_body(ForgetIn, 400, "invalid_request")
 progress_v2_body = json_body(ProgressV2In, 422, "invalid")  # /v2 only: always answered as `invalid`
 merge_v2_body = json_body(ProgressV2Merge, 422, "invalid")
+preset_body = json_body(PresetIn, 422, "invalid")
+
+PresetKind = Annotated[str, Path(pattern=PRESET_KIND_PATTERN)]
+
+
+async def preset_name(name: str) -> str:
+    name = name.strip()
+    if not 1 <= len(name) <= PRESET_NAME_MAX or "\x00" in name:
+        msg = f"name must be 1 to {PRESET_NAME_MAX} characters"
+        raise Refused(
+            422, "invalid", errors=[{"loc": ["path", "name"], "msg": msg, "type": "string_length"}], message=INVALID
+        )
+    return name
 
 
 async def progress_item(vod_id: str, body: Annotated[ProgressIn, Depends(progress_body)]) -> ProgressItem:
@@ -490,6 +544,10 @@ def _user_json(row: Any) -> dict[str, Any]:
 def _progress_json(row: Any) -> dict[str, Any]:
     m = row._mapping  # not row.t: Row has a .t of its own
     return {"vodId": m["vod_id"], "t": m["t"], "duration": m["duration"], "updatedAt": m["updated_at"]}
+
+
+def _preset(row: Any) -> dict[str, Any]:
+    return {"name": row.name, "value": row.value, "updated_at": _utc(row.updated_at)}
 
 
 def _user_v2(row: Any) -> dict[str, Any]:
@@ -1340,6 +1398,69 @@ def create_app(
     ) -> Response:
         """Many entries at once, newest winning each. Read the result back with GET /v2/progress."""
         await upsert_progress(conn, sess.user_id, [_v1_item(i) for i in body.items])
+        return Response(status_code=204)
+
+    # ── presets ────────────────────────────────────────────────────────────────
+    # /v2 only. Named sets of settings per `kind`; what a value means is the site's business.
+
+    @app.get("/v2/presets/{kind}", response_model=PresetPage, responses={401: PROBLEM, 422: PROBLEM}, tags=["presets"])
+    async def presets_index(kind: PresetKind, sess: ReadSession, conn: ReadConn) -> Response:
+        rows = await conn.execute(
+            select(presets).where(presets.c.user_id == sess.user_id, presets.c.kind == kind).order_by(presets.c.name)
+        )
+        return JSONResponse({"items": [_preset(r) for r in rows], "next_cursor": None})
+
+    @app.put(
+        "/v2/presets/{kind}/{name}",
+        response_model=PresetOut,
+        responses={401: PROBLEM, 403: PROBLEM, 422: PROBLEM},
+        tags=["presets"],
+    )
+    async def presets_put(
+        kind: PresetKind,
+        name: Annotated[str, Depends(preset_name)],
+        body: Annotated[PresetIn, Depends(preset_body)],
+        sess: WriteSession,
+        conn: WriteConn,
+    ) -> Response:
+        """Creates the preset or replaces its value."""
+        # The user's row is locked so two writes at once can't both slip under the cap.
+        await conn.execute(select(users.c.id).where(users.c.id == sess.user_id).with_for_update(key_share=True))
+        others = await conn.scalar(
+            select(func.count())
+            .select_from(presets)
+            .where(presets.c.user_id == sess.user_id, presets.c.kind == kind, presets.c.name != name)
+        )
+        if (others or 0) >= PRESETS_MAX:
+            msg = f"at most {PRESETS_MAX} presets per kind"
+            raise Refused(
+                422, "invalid", errors=[{"loc": ["path", "name"], "msg": msg, "type": "too_many"}], message=INVALID
+            )
+        stmt = pg_insert(presets).values(
+            user_id=sess.user_id, kind=kind, name=name, value=body.value, updated_at=clock()
+        )
+        row = (
+            await conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[presets.c.user_id, presets.c.kind, presets.c.name],
+                    set_={"value": stmt.excluded.value, "updated_at": stmt.excluded.updated_at},
+                ).returning(presets)
+            )
+        ).one()
+        return JSONResponse(_preset(row))
+
+    @app.delete(
+        "/v2/presets/{kind}/{name}",
+        status_code=204,
+        responses={401: PROBLEM, 403: PROBLEM, 422: PROBLEM},
+        tags=["presets"],
+    )
+    async def presets_delete(
+        kind: PresetKind, name: Annotated[str, Depends(preset_name)], sess: WriteSession, conn: WriteConn
+    ) -> Response:
+        await conn.execute(
+            delete(presets).where(presets.c.user_id == sess.user_id, presets.c.kind == kind, presets.c.name == name)
+        )
         return Response(status_code=204)
 
     # ── backends ───────────────────────────────────────────────────────────────

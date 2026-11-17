@@ -75,6 +75,13 @@ route has a `/v2` twin that follows [`.conventions/API.md`](.conventions/API.md)
   takes `{position_seconds, duration_seconds, updated_at}`, where `updated_at` must carry its zone.
   `GET /v2/progress?limit=&cursor=` is `{items, next_cursor}` (50 a page, at most 500), newest first.
   `POST /v2/progress/merge` takes `{items: [...]}` and answers 204; read the result back with `GET`.
+- **Presets** (`/v2` only) are named sets of settings a user saves per `kind`, e.g. one OBS overlay's form.
+  `GET /v2/presets/{kind}` is `{items: [{name, value, updated_at}], next_cursor: null}`, sorted by name.
+  `PUT /v2/presets/{kind}/{name}` takes `{value: {...}}`, creates or replaces, and answers the item;
+  `DELETE /v2/presets/{kind}/{name}` answers 204, also when there was none. Limits, each a 422 `invalid`:
+  `kind` matches `^[a-z0-9._-]{1,64}$`, `name` is 1 to 64 characters after stripping, `value` is a JSON
+  object of at most 4096 bytes encoded compactly, and a user keeps at most 50 presets per kind. Forget
+  me deletes them.
 - **Writes** send the session's `csrf` as `X-CSRF-Token`.
 - **Errors** are `application/problem+json`: `{type, title, status, code, detail?, request_id}`. `code`
   is the same stable code `/v1` sends as `error` (`signed_out`, `csrf`, `scope_missing`, ...). A body
