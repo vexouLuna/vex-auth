@@ -121,6 +121,18 @@ progress = Table(
     Index("progress_user_updated", "user_id", "updated_at"),
 )
 
+# Named sets of settings a user saves per kind (what the settings are for, e.g. one OBS overlay's form).
+presets = Table(
+    "presets",
+    metadata,
+    Column("user_id", Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("kind", Text, nullable=False),
+    Column("name", Text, nullable=False),
+    Column("value", JSONB, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    PrimaryKeyConstraint("user_id", "kind", "name"),
+)
+
 audit = Table(
     "audit",
     metadata,
