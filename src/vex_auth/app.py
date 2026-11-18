@@ -9,7 +9,13 @@ Browsers (the sites, from their own origins, with credentials):
   /v1/progress[/{vodId}]          watch progress (GET, PUT, DELETE; POST /v1/progress/merge imports many,
                                   DELETE /v1/progress clears it all)
   /v2/presets/{kind}[/{name}]     named sets of settings per kind, /v2 only (GET the kind's list; PUT {value}
-                                  and DELETE one by name)
+                                  and DELETE one by name); each has a public_id
+  /v2/files[/{id}]                overlay sounds and images the user uploaded (POST raw bytes, GET the list,
+                                  DELETE one)
+
+Anyone, with no sign-in (an OBS browser source has only its link), rate-limited per address:
+  GET  /v2/public/presets/{public_id}   one preset's kind and value
+  GET  /v2/public/files/{id}            one uploaded file's bytes
 
 Backends (registered clients, HTTP Basic with their id and secret):
   GET  /authorize?client_id&redirect_uri&state[&scope]   a one-time code; straight back when already signed in
@@ -77,6 +83,7 @@ from vex_auth.config import EXTRA_SCOPES, Client, Settings, origin_of
 from vex_auth.db import (
     audit,
     codes,
+    files,
     login_states,
     presets,
     progress,
@@ -112,11 +119,42 @@ VOD_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,100}$"
 PAGE_DEFAULT, PAGE_MAX = 50, 500  # /v2 lists
 PRESET_KIND_PATTERN = r"^[a-z0-9._-]{1,64}$"
 PRESET_NAME_MAX = 64  # characters, after stripping
-PRESET_VALUE_MAX = 4096  # bytes of compact JSON
+PRESET_VALUE_MAX = 16_384  # bytes of compact JSON: a wheel of 100 options with colours and images fits
 PRESETS_MAX = 50  # per user per kind
+FILE_MAX = 4 * 1024 * 1024  # bytes per uploaded file
+FILES_TOTAL_MAX = 50 * 1024 * 1024  # bytes per user, all files together
+FILES_MAX = 200  # per user
+FILE_NAME_MAX = 120  # characters
+PUBLIC_ID_PATTERN = r"^[A-Za-z0-9_-]{16,64}$"
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 INVALID = "The request did not validate."
 HOME_URL = "https://vexoul.net"  # where an error page sends someone it can't place
+
+
+def sniff(data: bytes) -> str | None:
+    """The media type the bytes start like, from the few kinds an overlay may use; None for anything else.
+
+    The client's Content-Type is never believed. No SVG, HTML or anything else a browser could run."""
+    head = data[:16]
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "audio/wav"
+    if head.startswith(b"OggS"):
+        return "audio/ogg"
+    if head.startswith(b"fLaC"):
+        return "audio/flac"
+    if head.startswith(b"ID3") or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0 and head[1] & 0x06):
+        return "audio/mpeg"  # an ID3 tag, or an MPEG audio frame sync with a layer set
+    if head[4:8] == b"ftyp" and head[8:12] in (b"M4A ", b"M4B "):
+        return "audio/mp4"
+    return None
 
 
 def _hash(value: str) -> bytes:
@@ -320,6 +358,28 @@ class PresetOut(BaseModel):
     name: str
     value: dict[str, Any]
     updated_at: str = Field(description="ISO 8601 UTC")
+    public_id: str = Field(description="Read it with no sign-in at GET /v2/public/presets/{public_id}")
+
+
+class PublicPresetOut(BaseModel):
+    kind: str
+    value: dict[str, Any]
+    updated_at: str = Field(description="ISO 8601 UTC")
+
+
+class FileOut(BaseModel):
+    id: str = Field(description="Unguessable; anyone may read GET /v2/public/files/{id}")
+    name: str
+    content_type: str
+    size_bytes: int
+    created_at: str = Field(description="ISO 8601 UTC")
+
+
+class FilePage(BaseModel):
+    items: list[FileOut]
+    next_cursor: None = None
+    used_bytes: int
+    max_bytes: int
 
 
 class PresetPage(BaseModel):
@@ -547,7 +607,21 @@ def _progress_json(row: Any) -> dict[str, Any]:
 
 
 def _preset(row: Any) -> dict[str, Any]:
-    return {"name": row.name, "value": row.value, "updated_at": _utc(row.updated_at)}
+    return {"name": row.name, "value": row.value, "updated_at": _utc(row.updated_at), "public_id": row.public_id}
+
+
+def _file(row: Any) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "content_type": row.content_type,
+        "size_bytes": row.size_bytes,
+        "created_at": _utc(row.created_at),
+    }
+
+
+def _invalid(loc: list[str], msg: str, kind: str) -> Refused:
+    return Refused(422, "invalid", errors=[{"loc": loc, "msg": msg, "type": kind}], message=INVALID)
 
 
 def _user_v2(row: Any) -> dict[str, Any]:
@@ -603,6 +677,8 @@ def create_app(
     login_limit = Limiter(20, 60)
     backend_limit = Limiter(120, 60)
     write_limit = Limiter(240, 60)
+    upload_limit = Limiter(30, 60)  # per user: each upload is up to FILE_MAX bytes into the database
+    public_limit = Limiter(300, 60)  # per address, for /v2/public/*
     last_cleanup: datetime | None = None
 
     @asynccontextmanager
@@ -1437,7 +1513,12 @@ def create_app(
                 422, "invalid", errors=[{"loc": ["path", "name"], "msg": msg, "type": "too_many"}], message=INVALID
             )
         stmt = pg_insert(presets).values(
-            user_id=sess.user_id, kind=kind, name=name, value=body.value, updated_at=clock()
+            user_id=sess.user_id,
+            kind=kind,
+            name=name,
+            value=body.value,
+            updated_at=clock(),
+            public_id=secrets.token_urlsafe(16),  # a replace keeps the old one: the OBS link stays the same
         )
         row = (
             await conn.execute(
@@ -1462,6 +1543,146 @@ def create_app(
             delete(presets).where(presets.c.user_id == sess.user_id, presets.c.kind == kind, presets.c.name == name)
         )
         return Response(status_code=204)
+
+    # ── files ──────────────────────────────────────────────────────────────────
+    # /v2 only. Sounds and images for overlays. Stored in Postgres, so they go with the account and with
+    # the database's backups. Only the owner lists or deletes them; anyone with the id reads one.
+
+    file_meta = [c for c in files.c if c.name != "data"]
+
+    @app.get("/v2/files", response_model=FilePage, responses={401: PROBLEM}, tags=["files"])
+    async def files_index(sess: ReadSession, conn: ReadConn) -> Response:
+        rows = (
+            await conn.execute(
+                select(*file_meta)
+                .where(files.c.user_id == sess.user_id)
+                .order_by(files.c.created_at.desc(), files.c.id)
+            )
+        ).all()
+        return JSONResponse(
+            {
+                "items": [_file(r) for r in rows],
+                "next_cursor": None,
+                "used_bytes": sum(r.size_bytes for r in rows),
+                "max_bytes": FILES_TOTAL_MAX,
+            }
+        )
+
+    @app.post(
+        "/v2/files",
+        status_code=201,
+        response_model=FileOut,
+        responses={401: PROBLEM, 403: PROBLEM, 413: PROBLEM, 422: PROBLEM, 429: PROBLEM},
+        tags=["files"],
+    )
+    async def files_upload(
+        request: Request,
+        sess: WriteSession,
+        conn: WriteConn,
+        name: Annotated[str, Query(max_length=FILE_NAME_MAX)] = "",
+    ) -> Response:
+        """The request body is the file's bytes, `?name=` its label. Its kind is read from the bytes (PNG,
+        JPEG, GIF, WebP, MP3, Ogg, WAV, FLAC, M4A); anything else is refused, whatever Content-Type says."""
+        if not upload_limit.allow(sess.user_id):
+            raise Refused(429, "rate_limited")
+        too_large = Refused(413, "too_large", message=f"A file may be at most {FILE_MAX} bytes.")
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > FILE_MAX:
+            raise too_large
+        data = bytearray()
+        async for chunk in request.stream():
+            data += chunk
+            if len(data) > FILE_MAX:
+                raise too_large
+        if not data:
+            raise _invalid(["body"], "the file is empty", "missing")
+        content_type = sniff(bytes(data))
+        if content_type is None:
+            raise _invalid(["body"], "only PNG, JPEG, GIF, WebP, MP3, Ogg, WAV, FLAC or M4A", "file_type")
+        label = "".join(ch for ch in name.strip() if ch.isprintable()) or "file"
+        # The user's row is locked so two uploads at once can't both slip under the caps.
+        await conn.execute(select(users.c.id).where(users.c.id == sess.user_id).with_for_update(key_share=True))
+        held_count, held_bytes = (
+            await conn.execute(
+                select(func.count(), func.coalesce(func.sum(files.c.size_bytes), 0)).where(
+                    files.c.user_id == sess.user_id
+                )
+            )
+        ).one()
+        if held_count >= FILES_MAX:
+            raise _invalid(["body"], f"at most {FILES_MAX} files", "too_many")
+        if held_bytes + len(data) > FILES_TOTAL_MAX:
+            raise _invalid(["body"], f"your files may take at most {FILES_TOTAL_MAX} bytes together", "too_big")
+        row = (
+            await conn.execute(
+                insert(files)
+                .values(
+                    id=secrets.token_urlsafe(16),
+                    user_id=sess.user_id,
+                    name=label,
+                    content_type=content_type,
+                    size_bytes=len(data),
+                    data=bytes(data),
+                    created_at=clock(),
+                )
+                .returning(*file_meta)
+            )
+        ).one()
+        return JSONResponse(_file(row), status_code=201)
+
+    @app.delete("/v2/files/{file_id}", status_code=204, responses={401: PROBLEM, 403: PROBLEM}, tags=["files"])
+    async def files_delete(file_id: str, sess: WriteSession, conn: WriteConn) -> Response:
+        """Gone at once from every overlay that uses it. 204 also when there was none."""
+        await conn.execute(delete(files).where(files.c.user_id == sess.user_id, files.c.id == file_id))
+        return Response(status_code=204)
+
+    # ── public reads ───────────────────────────────────────────────────────────
+    # No sign-in: an OBS browser source has only its link, and the id in it is the secret. CORS stays the
+    # site origins: the overlays are pages on vexoul.net, and <img>/<audio> need no CORS at all.
+
+    async def public_guard(request: Request) -> None:
+        if not public_limit.allow(ip_of(request)):
+            raise Refused(429, "rate_limited")
+
+    Public = Annotated[None, Depends(public_guard)]  # noqa: N806
+    PublicId = Annotated[str, Path(pattern=PUBLIC_ID_PATTERN)]  # noqa: N806
+
+    @app.get(
+        "/v2/public/presets/{public_id}",
+        response_model=PublicPresetOut,
+        responses={404: PROBLEM, 422: PROBLEM, 429: PROBLEM},
+        tags=["public"],
+    )
+    async def public_preset(public_id: PublicId, _: Public, conn: ReadConn) -> Response:
+        row = (await conn.execute(select(presets).where(presets.c.public_id == public_id))).first()
+        if row is None:
+            raise Refused(404, "not_found")
+        return JSONResponse(
+            {"kind": row.kind, "value": row.value, "updated_at": _utc(row.updated_at)},
+            headers={"Cache-Control": "no-cache"},  # an edit reaches the source on its next load
+        )
+
+    @app.get(
+        "/v2/public/files/{file_id}",
+        response_class=Response,
+        responses={404: PROBLEM, 422: PROBLEM, 429: PROBLEM},
+        tags=["public"],
+    )
+    async def public_file(file_id: PublicId, _: Public, conn: ReadConn) -> Response:
+        row = (await conn.execute(select(files.c.data, files.c.content_type).where(files.c.id == file_id))).first()
+        if row is None:
+            raise Refused(404, "not_found")
+        return Response(
+            row.data,
+            media_type=row.content_type,  # one of sniff()'s, set at upload: only images and audio
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": "inline",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+                "Cross-Origin-Resource-Policy": "cross-origin",
+                "Cache-Control": "public, max-age=31536000, immutable",  # a file never changes under its id
+            },
+        )
 
     # ── backends ───────────────────────────────────────────────────────────────
 

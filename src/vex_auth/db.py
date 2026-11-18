@@ -21,12 +21,14 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     MetaData,
     PrimaryKeyConstraint,
     Table,
     Text,
     create_engine,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -130,7 +132,26 @@ presets = Table(
     Column("name", Text, nullable=False),
     Column("value", JSONB, nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    # What an OBS source's link carries (?p=). The service sets it; the default (revision 0006) covers an insert
+    # without one, such as the previous release's while a deploy migrates.
+    Column(
+        "public_id", Text, nullable=False, unique=True, server_default=text("replace(gen_random_uuid()::text, '-', '')")
+    ),
     PrimaryKeyConstraint("user_id", "kind", "name"),
+)
+
+# Files a user uploads for their overlays (sounds, images), read publicly by their unguessable id.
+files = Table(
+    "files",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("user_id", Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("name", Text, nullable=False),
+    Column("content_type", Text, nullable=False),  # sniffed from the bytes, never the client's word
+    Column("size_bytes", Integer, nullable=False),
+    Column("data", LargeBinary, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Index("files_user_id", "user_id"),
 )
 
 audit = Table(
