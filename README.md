@@ -76,12 +76,26 @@ route has a `/v2` twin that follows [`.conventions/API.md`](.conventions/API.md)
   `GET /v2/progress?limit=&cursor=` is `{items, next_cursor}` (50 a page, at most 500), newest first.
   `POST /v2/progress/merge` takes `{items: [...]}` and answers 204; read the result back with `GET`.
 - **Presets** (`/v2` only) are named sets of settings a user saves per `kind`, e.g. one OBS overlay's form.
-  `GET /v2/presets/{kind}` is `{items: [{name, value, updated_at}], next_cursor: null}`, sorted by name.
+  `GET /v2/presets/{kind}` is `{items: [{name, value, updated_at, public_id}], next_cursor: null}`, sorted by name.
   `PUT /v2/presets/{kind}/{name}` takes `{value: {...}}`, creates or replaces, and answers the item;
   `DELETE /v2/presets/{kind}/{name}` answers 204, also when there was none. Limits, each a 422 `invalid`:
   `kind` matches `^[a-z0-9._-]{1,64}$`, `name` is 1 to 64 characters after stripping, `value` is a JSON
-  object of at most 4096 bytes encoded compactly, and a user keeps at most 50 presets per kind. Forget
-  me deletes them.
+  object of at most 16384 bytes encoded compactly, and a user keeps at most 50 presets per kind. Forget
+  me deletes them. `public_id` is unguessable and stays the same when the value is replaced.
+- **Files** (`/v2` only) are sounds and images a user uploads for their OBS overlays, stored in Postgres.
+  `POST /v2/files?name=<label>` takes the file's bytes as the body and answers 201 with
+  `{id, name, content_type, size_bytes, created_at}`. The type is read from the bytes, never the header:
+  PNG, JPEG, GIF, WebP, MP3, Ogg, WAV, FLAC or M4A (no SVG); anything else is 422 `invalid`. A file is at
+  most 4 MiB (413 `too_large`); a user keeps at most 200 files and 50 MiB together (422, `too_many` /
+  `too_big`), and uploads 30 a minute. `GET /v2/files` lists only the caller's own, newest first, with
+  `used_bytes` and `max_bytes`; `DELETE /v2/files/{id}` answers 204. Forget me deletes them.
+- **Public reads** need no sign-in, because an OBS browser source has only its link: the id in it is the
+  secret. `GET /v2/public/presets/{public_id}` → `{kind, value, updated_at}` (`Cache-Control: no-cache`)
+  and `GET /v2/public/files/{id}` → the bytes with the stored type, `X-Content-Type-Options: nosniff`,
+  `Content-Disposition: inline`, `Content-Security-Policy: default-src 'none'; sandbox` and
+  `Cross-Origin-Resource-Policy: cross-origin`, cached as immutable. 300 a minute per address (429
+  `rate_limited`), 404 `not_found` for an unknown id. CORS is unchanged (the site origins): the overlays
+  are pages on vexoul.net, and `<img>`/`<audio>` need no CORS.
 - **Writes** send the session's `csrf` as `X-CSRF-Token`.
 - **Errors** are `application/problem+json`: `{type, title, status, code, detail?, request_id}`. `code`
   is the same stable code `/v1` sends as `error` (`signed_out`, `csrf`, `scope_missing`, ...). A body

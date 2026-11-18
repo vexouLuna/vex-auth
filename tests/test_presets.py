@@ -39,15 +39,27 @@ async def test_round_trip_replace_delete(h: Harness) -> None:
     assert (await h.http.get("/v2/presets/obs.chat")).json() == {"items": [], "next_cursor": None}
     value = {"font": "Inter", "size": 24, "nested": {"shadow": True, "tags": ["a", "ü"]}}
     put = await h.http.put("/v2/presets/obs.chat/Stream", headers=hd, json={"value": value})
-    assert (put.status_code, put.json()) == (200, {"name": "Stream", "value": value, "updated_at": NOW})
+    pid = put.json()["public_id"]
+    assert (put.status_code, put.json()) == (
+        200,
+        {"name": "Stream", "value": value, "updated_at": NOW, "public_id": pid},
+    )
     await h.http.put("/v2/presets/obs.chat/%20Big%20text%20", headers=hd, json={"value": {}})  # name is stripped
     await h.http.put("/v2/presets/obs.alerts/Stream", headers=hd, json={"value": {"other": "kind"}})
 
     h.clock.advance(hours=1)
     replaced = await h.http.put("/v2/presets/obs.chat/Stream", headers=hd, json={"value": {"size": 30}})
-    assert replaced.json() == {"name": "Stream", "value": {"size": 30}, "updated_at": "2026-09-29T13:00:00Z"}
+    assert replaced.json() == {
+        "name": "Stream",
+        "value": {"size": 30},
+        "updated_at": "2026-09-29T13:00:00Z",
+        "public_id": pid,  # a replace keeps the public id, so an OBS link keeps working
+    }
+    items = (await h.http.get("/v2/presets/obs.chat")).json()["items"]
+    big = {"name": "Big text", "value": {}, "updated_at": NOW, "public_id": items[0]["public_id"]}
+    assert items[0]["public_id"] != pid
     assert (await h.http.get("/v2/presets/obs.chat")).json() == {
-        "items": [{"name": "Big text", "value": {}, "updated_at": NOW}, replaced.json()],  # sorted by name
+        "items": [big, replaced.json()],  # sorted by name
         "next_cursor": None,
     }
 
@@ -126,7 +138,14 @@ async def test_at_most_fifty_per_kind(h: Harness, engine: AsyncEngine) -> None:
     await h.sign_in()
     hd = await csrf(h)
     rows = [
-        {"user_id": ALICE.id, "kind": "obs.chat", "name": f"p{i:02}", "value": {}, "updated_at": h.clock()}
+        {
+            "user_id": ALICE.id,
+            "kind": "obs.chat",
+            "name": f"p{i:02}",
+            "value": {},
+            "updated_at": h.clock(),
+            "public_id": f"public-id-{i:06}",
+        }
         for i in range(PRESETS_MAX)
     ]
     async with engine.begin() as conn:
@@ -152,3 +171,32 @@ async def test_forget_me_removes_presets(h: Harness, engine: AsyncEngine) -> Non
     forgot = await h.http.request("DELETE", "/v2/me", headers=hd, json={"confirm": "alice"})
     assert forgot.status_code == 204
     assert (await count(engine, ALICE.id), await count(engine, BOB.id)) == (0, 1)
+
+
+async def test_public_read_by_id(h: Harness) -> None:
+    await h.sign_in()
+    hd = await csrf(h)
+    put = await h.http.put("/v2/presets/obs.wheel/Main", headers=hd, json={"value": {"options": ["a", "b"]}})
+    pid = put.json()["public_id"]
+    anyone = h.another_browser()  # an OBS source: no cookie
+    got = await anyone.http.get(f"/v2/public/presets/{pid}")
+    assert (got.status_code, got.json()) == (
+        200,
+        {"kind": "obs.wheel", "value": {"options": ["a", "b"]}, "updated_at": NOW},
+    )
+    assert got.headers["cache-control"] == "no-cache"
+    await h.http.put("/v2/presets/obs.wheel/Main", headers=hd, json={"value": {"options": ["c"]}})
+    assert (await anyone.http.get(f"/v2/public/presets/{pid}")).json()["value"] == {"options": ["c"]}
+
+    missing = await anyone.http.get("/v2/public/presets/" + "x" * 22)
+    assert (missing.status_code, missing.json()["code"]) == (404, "not_found")
+    assert invalid(await anyone.http.get("/v2/public/presets/short")) == ["path", "public_id"]
+    await h.http.delete("/v2/presets/obs.wheel/Main", headers=hd)
+    assert (await anyone.http.get(f"/v2/public/presets/{pid}")).status_code == 404
+
+
+async def test_public_reads_are_rate_limited(h: Harness) -> None:
+    anyone = h.another_browser()
+    codes = [(await anyone.http.get("/v2/public/presets/" + "x" * 22)).status_code for _ in range(301)]
+    assert codes[:300] == [404] * 300
+    assert codes[300] == 429

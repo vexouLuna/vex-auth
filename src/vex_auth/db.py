@@ -21,6 +21,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     MetaData,
     PrimaryKeyConstraint,
@@ -130,7 +131,22 @@ presets = Table(
     Column("name", Text, nullable=False),
     Column("value", JSONB, nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("public_id", Text, nullable=False, unique=True),  # what an OBS source's link carries (?p=)
     PrimaryKeyConstraint("user_id", "kind", "name"),
+)
+
+# Files a user uploads for their overlays (sounds, images), read publicly by their unguessable id.
+files = Table(
+    "files",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("user_id", Text, ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("name", Text, nullable=False),
+    Column("content_type", Text, nullable=False),  # sniffed from the bytes, never the client's word
+    Column("size_bytes", Integer, nullable=False),
+    Column("data", LargeBinary, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Index("files_user_id", "user_id"),
 )
 
 audit = Table(
