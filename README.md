@@ -3,7 +3,7 @@
 <!-- conventions:begin: synced from vexouLuna/conventions; edit it there, then run `conventions sync` -->
 [![CI](https://github.com/vexouLuna/vex-auth/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/vexouLuna/vex-auth/actions/workflows/ci.yml?query=branch%3Amain)
 [![version](https://img.shields.io/github/v/tag/vexouLuna/vex-auth?sort=semver&label=version)](https://github.com/vexouLuna/vex-auth/tags)
-[![conventions v4.0.0](https://img.shields.io/badge/conventions-v4.0.0-blue)](https://github.com/vexouLuna/conventions/tree/v4.0.0)
+[![conventions v4.1.0](https://img.shields.io/badge/conventions-v4.1.0-blue)](https://github.com/vexouLuna/conventions/tree/v4.1.0)
 [![api_auth-api](https://status.vexoul.net/api/v1/endpoints/api_auth-api/health/badge.svg)](https://status.vexoul.net)
 [![api_auth-api uptime 7d](https://status.vexoul.net/api/v1/endpoints/api_auth-api/uptimes/7d/badge.svg)](https://status.vexoul.net)
 [![deployed](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fauth.vexoul.net%2Freadyz&query=%24.version&label=deployed)](https://auth.vexoul.net)
