@@ -15,6 +15,8 @@ down_revision: str | None = "0005"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+PUBLIC_ID_DEFAULT = "replace(gen_random_uuid()::text, '-', '')"
+
 
 def upgrade() -> None:
     op.create_table(
@@ -28,10 +30,13 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index("files_user_id", "files", ["user_id"])
-    op.add_column("presets", sa.Column("public_id", sa.Text))
-    # 122 random bits per existing row; new rows get theirs from the service.
-    op.execute("UPDATE presets SET public_id = replace(gen_random_uuid()::text, '-', '')")
-    op.alter_column("presets", "public_id", nullable=False)
+    # 122 random bits, drawn per row (the default is volatile, so existing rows each get their own). The service
+    # sets its own value; the default also covers the previous release, which still serves while this migrates
+    # and inserts presets without one.
+    op.add_column(
+        "presets",
+        sa.Column("public_id", sa.Text, nullable=False, server_default=sa.text(PUBLIC_ID_DEFAULT)),
+    )
     op.create_unique_constraint("presets_public_id", "presets", ["public_id"])
 
 

@@ -28,6 +28,7 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -131,7 +132,11 @@ presets = Table(
     Column("name", Text, nullable=False),
     Column("value", JSONB, nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
-    Column("public_id", Text, nullable=False, unique=True),  # what an OBS source's link carries (?p=)
+    # What an OBS source's link carries (?p=). The service sets it; the default (revision 0006) covers an insert
+    # without one, such as the previous release's while a deploy migrates.
+    Column(
+        "public_id", Text, nullable=False, unique=True, server_default=text("replace(gen_random_uuid()::text, '-', '')")
+    ),
     PrimaryKeyConstraint("user_id", "kind", "name"),
 )
 
